@@ -4,14 +4,41 @@ Interactive terminal tool for managing stacked GitHub pull requests — a line
 of PRs following the lead, whether that's one branch against `main` or a
 three-deep stack.
 
-Pure bash. Requires `git`, [`gh`](https://cli.github.com) (authenticated),
-`jq`, and bash ≥ 4 (`brew install bash` on macOS).
-
 ## Install
 
-```bash
-./install.sh                 # installs to ~/.local/bin (override with PREFIX=…)
+```sh
+git clone https://github.com/jakiestfu/git-convoy.git
+cd git-convoy
+./install.sh
 ```
+
+By default, files are installed to `~/.local/bin`:
+
+- `~/.local/bin/git-convoy` — the dispatcher
+- `~/.local/bin/git-cv` — alias symlink
+- `~/.local/bin/git-convoy.d/*` — individual subcommands
+
+To install somewhere else:
+
+```sh
+PREFIX=/usr/local/bin ./install.sh
+```
+
+If `~/.local/bin` is not on your `PATH`, add this to `~/.zshrc` or
+`~/.bashrc`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Re-running `./install.sh` is safe — it overwrites in place.
+
+## Requirements
+
+- `git`
+- [`gh`](https://cli.github.com), authenticated
+- `jq`
+- Bash 4+ (macOS ships bash 3.2; `brew install bash`)
 
 ## Usage
 
@@ -64,13 +91,3 @@ Safety properties:
   your original branch is checked back out. Already-completed branches were
   each rebased *and* pushed, so a partial refresh is safe to resume by
   pressing Enter again.
-
-## Design notes
-
-- Architecture mirrors [jakiestfu/git-ai](https://github.com/jakiestfu/git-ai):
-  a `bin/git-convoy` dispatcher `exec`s subcommands from `libexec/git-convoy.d/`,
-  discovered via their `# Description:` header lines.
-- Sequential per-branch `git rebase --onto` was chosen over a single
-  `git rebase --update-refs` from the tip: it maps one-to-one onto per-branch
-  progress rows, attributes conflicts to the exact branch, and lets each ✓
-  mean "rebased and pushed".
