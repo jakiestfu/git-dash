@@ -7,9 +7,13 @@ three-deep stack.
 ## Install
 
 ```sh
-git clone https://github.com/jakiestfu/git-convoy.git
-cd git-convoy
-./install.sh
+# Quick install (one-liner)
+curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-convoy/main/install.sh | bash
+
+# Or inspect first
+curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-convoy/main/install.sh -o install.sh
+less install.sh
+bash install.sh
 ```
 
 By default, files are installed to `~/.local/bin`:
@@ -39,6 +43,14 @@ Re-running `./install.sh` is safe — it overwrites in place.
 - [`gh`](https://cli.github.com), authenticated
 - `jq`
 - Bash 4+ (macOS ships bash 3.2; `brew install bash`)
+
+## Developing
+
+```sh
+git clone https://github.com/jakiestfu/git-convoy.git
+cd git-convoy
+./install.sh
+```
 
 ## Usage
 
