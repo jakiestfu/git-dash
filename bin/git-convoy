@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_dir() {
+	local src=${BASH_SOURCE[0]} dir
+	while [[ -L $src ]]; do
+		dir="$(cd -P -- "$(dirname -- "$src")" && pwd)"
+		src="$(readlink "$src")"
+		[[ $src != /* ]] && src="$dir/$src"
+	done
+	cd -P -- "$(dirname -- "$src")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+if [[ -d "$SCRIPT_DIR/../libexec/git-convoy.d" ]]; then
+	SUBCOMMAND_DIR="$(cd -- "$SCRIPT_DIR/../libexec/git-convoy.d" && pwd)"
+else
+	SUBCOMMAND_DIR="$SCRIPT_DIR/git-convoy.d"
+fi
+
+show_help() {
+	echo "Usage: git convoy [<command>] [<args>]     (also installed as: git cv)"
+	echo
+	echo "Manage your stacked pull requests. With no command, opens the"
+	echo "interactive stack view for the current branch."
+	echo
+	echo "Available commands:"
+
+	if [[ -d "$SUBCOMMAND_DIR" ]]; then
+		for file in "$SUBCOMMAND_DIR"/*; do
+			[[ -f "$file" ]] || continue
+
+			name="$(basename -- "$file")"
+			[[ $name == _* ]] && continue
+			description="$(sed -n 's/^# Description: //p' "$file" | head -n 1)"
+
+			if [[ -n "$description" ]]; then
+				printf "  %-15s %s\n" "$name" "$description"
+			else
+				printf "  %s\n" "$name"
+			fi
+		done
+	fi
+
+	echo
+	echo "Run 'git convoy <command> --help' for command-specific help."
+}
+
+case "${1:-}" in
+-h | --help | help)
+	show_help
+	exit 0
+	;;
+esac
+
+# Bare `git convoy` (or bare flags like --no-push) opens the interactive view.
+if [[ $# -eq 0 || ${1:0:1} == - ]]; then
+	exec "$SUBCOMMAND_DIR/view" "$@"
+fi
+
+subcommand="$1"
+shift
+
+path="$SUBCOMMAND_DIR/$subcommand"
+
+if [[ ! -f "$path" || ${subcommand:0:1} == _ ]]; then
+	echo "Unknown command: $subcommand"
+	echo
+	show_help
+	exit 1
+fi
+
+exec "$path" "$@"

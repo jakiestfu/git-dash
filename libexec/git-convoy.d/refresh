@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Description: Rebase + push the stack up to a branch, non-interactively
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib
+source "$SCRIPT_DIR/_lib"
+
+PUSH=1
+TARGET_BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--no-push)
+		PUSH=0
+		shift
+		;;
+	-h | --help)
+		cat <<EOF
+Usage: git convoy refresh [BRANCH] [OPTIONS]
+
+Refresh BRANCH (default: the current branch) without the TUI: fast-forward
+the stack's root from origin, then rebase every branch between the root and
+BRANCH bottom-up, force-pushing each one (with lease).
+
+OPTIONS:
+  --no-push       Rebase locally only; skip force-pushing
+  -h, --help      Show this help message
+EOF
+		exit 0
+		;;
+	-*)
+		echo "Unknown option: $1"
+		echo "Run 'git convoy refresh --help' for usage information"
+		exit 1
+		;;
+	*)
+		TARGET_BRANCH=$1
+		shift
+		;;
+	esac
+done
+
+require_deps
+
+WORKDIR=$(mktemp -d)
+trap 'abort_rebase_if_any; restore_branch; rm -rf "$WORKDIR"' EXIT
+
+convoy_step() {
+	local i=$1 note=$2
+	shift 2
+	printf '  %s %s… ' "$(dim "→")" "$(cyan "${BRANCH[$i]}")"
+	local log="$WORKDIR/step.log"
+	if "$@" >"$log" 2>&1; then
+		STATUS[$i]=ok
+		printf '%s%s\n' "$(green "✓")" "${note:+ $(dim "$note")}"
+	else
+		STATUS[$i]=fail
+		printf '%s\n' "$(red "✗")"
+		tail -n 6 "$log" 2>/dev/null | sed 's/^/      /'
+		return 1
+	fi
+}
+
+load_prs
+build_stack "$TARGET_BRANCH"
+TARGET_ROW=${ROW_OF[${TARGET_BRANCH:-$CUR_BRANCH}]}
+
+if ! cascade "$TARGET_ROW" "$PUSH"; then
+	die "$CASCADE_ERR"
+fi
+printf '%s\n' "$(green "stack refreshed up to '${BRANCH[$TARGET_ROW]}'")"
