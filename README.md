@@ -18,8 +18,13 @@ bash install.sh
 
 By default, files are installed to `~/.local/bin`:
 
-- `~/.local/bin/git-convoy` — the tool (a single self-contained script)
+- `~/.local/bin/git-convoy` — the tool (a single self-contained Deno script)
 - `~/.local/bin/git-cv` — alias symlink
+
+Prefer a standalone binary with no Deno dependency? Grab a prebuilt
+`deno compile` binary for your platform from the
+[Releases page](https://github.com/jakiestfu/git-convoy/releases), drop it on
+your `PATH` as `git-convoy`, and symlink `git-cv` to it.
 
 To install somewhere else:
 
@@ -40,8 +45,8 @@ Re-running `./install.sh` is safe — it overwrites in place.
 
 - `git`
 - [`gh`](https://cli.github.com), authenticated
-- `jq`
-- Bash 4+ (macOS ships bash 3.2; `brew install bash`)
+- [Deno](https://deno.com) 2.x (not needed if you install a prebuilt binary
+  from Releases)
 
 ## Developing
 
@@ -49,7 +54,16 @@ Re-running `./install.sh` is safe — it overwrites in place.
 git clone https://github.com/jakiestfu/git-convoy.git
 cd git-convoy
 ./install.sh
+
+deno task check      # type-check
+deno task compile    # build a standalone binary into dist/
 ```
+
+The tool is a single TypeScript file, `bin/git-convoy`, run directly by Deno
+via its shebang (`bin/git-convoy.ts` is a symlink to it for editors and
+`deno check`). Tagging a release (`git tag v1.x.y && git push --tags`) makes
+CI compile binaries for Linux and macOS (x86_64 and arm64) and attach them to
+a GitHub release.
 
 ## Usage
 

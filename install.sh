@@ -61,7 +61,7 @@ ln -sf "$INSTALL_DIR/git-convoy" "$INSTALL_DIR/git-cv"
 green "Installed."
 
 missing_runtime_deps=()
-for dep in git gh jq; do
+for dep in git gh deno; do
 	if ! command -v "$dep" >/dev/null 2>&1; then
 		missing_runtime_deps+=("$dep")
 	fi
