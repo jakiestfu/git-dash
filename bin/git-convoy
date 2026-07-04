@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
 	exit 1
 fi
 
-PR_LIMIT=200
+PR_LIMIT=100
 
 USE_COLOR=1
 [[ -t 1 && -z ${NO_COLOR:-} ]] || USE_COLOR=0
@@ -55,53 +55,147 @@ repo_slug() {
 	echo "$url"
 }
 
-# ── PR data ──────────────────────────────────────────────────────────────────
-# One repo-wide `gh pr list` call feeds everything; downstack discovery is a
-# local reverse lookup through CHILDREN instead of per-branch API calls.
+# ── Config ───────────────────────────────────────────────────────────────────
+# Per-repo settings live in one JSON file in the user's home directory:
+#   { "repos": { "owner/repo": { "showChecks": true,
+#                                "actions": { "t": { "workflow": "x.yml",
+#                                                    "name": "X" } } } } }
 
-declare -A PR_BASE PR_NUM PR_ADDS PR_DELS PR_TITLE PR_DRAFT CHILDREN ROW_OF
+CONFIG_FILE="${GIT_CONVOY_CONFIG:-$HOME/.git-convoy.json}"
+SHOW_CHECKS=1
+declare -A ACTION_WF ACTION_NAME ACTION_RUN_ID
 
-load_prs() {
-	local rows
-	rows=$(gh pr list --state open --limit "$PR_LIMIT" \
-		--json number,title,headRefName,baseRefName,additions,deletions,isDraft \
-		--jq '.[] | [.headRefName, .baseRefName, (.number|tostring), (.additions|tostring), (.deletions|tostring), (.isDraft|tostring), .title] | @tsv') \
-		|| die "failed to list pull requests (is 'gh' authenticated for this repo?)"
+config_load() { # requires REPO_SLUG
+	ACTION_WF=() ACTION_NAME=()
+	SHOW_CHECKS=1
+	[[ -f $CONFIG_FILE && -n $REPO_SLUG ]] || return 0
 
-	local head base num adds dels draft title count=0
-	while IFS=$'\t' read -r head base num adds dels draft title; do
-		[[ -n $head ]] || continue
-		PR_BASE[$head]=$base
-		PR_NUM[$head]=$num
-		PR_ADDS[$head]=$adds
-		PR_DELS[$head]=$dels
-		PR_DRAFT[$head]=$draft
-		PR_TITLE[$head]=$title
-		CHILDREN[$base]+="$head "
-		count=$((count + 1))
-	done <<<"$rows"
+	local sc
+	sc=$(jq -r --arg r "$REPO_SLUG" \
+		'if .repos[$r].showChecks == false then 0 else 1 end' \
+		"$CONFIG_FILE" 2>/dev/null) || sc=1
+	[[ $sc == 0 ]] && SHOW_CHECKS=0
 
-	(( count > 0 )) || die "no open pull requests found in this repo"
-	if (( count >= PR_LIMIT )); then
-		printf '\033[33mwarning: hit the %s-PR limit; the stack may be incomplete\033[0m\n' "$PR_LIMIT" >&2
+	local key wf name
+	while IFS=$'\t' read -r key wf name; do
+		[[ -n $key && -n $wf ]] || continue
+		ACTION_WF[$key]=$wf
+		ACTION_NAME[$key]=${name:-$wf}
+	done < <(jq -r --arg r "$REPO_SLUG" \
+		'.repos[$r].actions // {} | to_entries[] | [.key, .value.workflow, .value.name] | @tsv' \
+		"$CONFIG_FILE" 2>/dev/null || true)
+}
+
+config_save() { # requires REPO_SLUG
+	[[ -n $REPO_SLUG ]] || return 0
+
+	local actions='{}' key
+	for key in ${ACTION_WF[@]+"${!ACTION_WF[@]}"}; do
+		actions=$(jq -n --argjson a "$actions" \
+			--arg k "$key" --arg w "${ACTION_WF[$key]}" --arg n "${ACTION_NAME[$key]}" \
+			'$a + {($k): {workflow: $w, name: $n}}')
+	done
+
+	local base='{}'
+	if [[ -f $CONFIG_FILE ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+		base=$(cat "$CONFIG_FILE")
 	fi
+
+	local tmp
+	tmp=$(mktemp "${TMPDIR:-/tmp}/git-convoy-config.XXXXXX")
+	jq -n --argjson base "$base" --arg r "$REPO_SLUG" \
+		--argjson sc "$SHOW_CHECKS" --argjson actions "$actions" \
+		'$base + {version: 1,
+		          repos: (($base.repos // {}) +
+		                  {($r): {showChecks: ($sc == 1), actions: $actions}})}' \
+		>"$tmp" && mv "$tmp" "$CONFIG_FILE"
+}
+
+# ── PR data ──────────────────────────────────────────────────────────────────
+# Both loaders fetch PRs as one TSV row each (title last: it may contain the
+# separator) via the same jq program, which also folds statusCheckRollup down
+# to "passed/total" plus a GitHub-style color: red if any check failed, else
+# yellow if any is still pending, else green.
+
+declare -A PR_BASE PR_NUM PR_ADDS PR_DELS PR_TITLE PR_DRAFT PR_CHECKS PR_CHECKS_COLOR
+declare -A CHILDREN ROW_OF ROOT_ROW_OF
+
+JQ_DEFS='
+def verdict:
+  ([.conclusion, .state, .status] | map(select(. != null and . != "")) | first // "")
+  | ascii_upcase;
+def checks_text:
+  (.statusCheckRollup // []) as $c
+  | if ($c | length) == 0 then "-"
+    else "\([$c[] | select(verdict | IN("SUCCESS","NEUTRAL","SKIPPED"))] | length)/\($c | length)"
+    end;
+def checks_color:
+  (.statusCheckRollup // []) as $c
+  | if ($c | length) == 0 then "-"
+    elif ([$c[] | select(verdict |
+        IN("FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE","ERROR"))] | length) > 0
+      then "red"
+    elif ([$c[] | select(verdict | IN("SUCCESS","NEUTRAL","SKIPPED"))] | length) < ($c | length)
+      then "yellow"
+    else "green" end;
+def row:
+  [.headRefName, .baseRefName, (.number|tostring), (.additions|tostring),
+   (.deletions|tostring), (.isDraft|tostring), checks_text, checks_color, .title]
+  | @tsv;
+'
+
+pr_fields() {
+	local f="number,title,headRefName,baseRefName,additions,deletions,isDraft,state"
+	(( SHOW_CHECKS )) && f+=",statusCheckRollup"
+	printf '%s' "$f"
+}
+
+# ingest_pr_line: tsv row -> assoc arrays; sets INGESTED_HEAD to the head
+# branch. (Must not be called in a command substitution — the array writes
+# would be lost in the subshell.)
+INGESTED_HEAD=""
+ingest_pr_line() {
+	local head base num adds dels draft ct cc title
+	IFS=$'\t' read -r head base num adds dels draft ct cc title <<<"$1"
+	[[ -n $head ]] || return 1
+	PR_BASE[$head]=$base
+	PR_NUM[$head]=$num
+	PR_ADDS[$head]=$adds
+	PR_DELS[$head]=$dels
+	PR_DRAFT[$head]=$draft
+	PR_TITLE[$head]=$title
+	[[ $ct == - ]] && ct=""
+	case "$cc" in green | yellow | red) ;; *) cc="" ;; esac
+	PR_CHECKS[$head]=$ct
+	PR_CHECKS_COLOR[$head]=$cc
+	INGESTED_HEAD=$head
 }
 
 # ── Stack model ──────────────────────────────────────────────────────────────
-# Parallel arrays indexed in render order: root first, descendants below,
-# depth encoding ancestry. Row 0 is always the synthetic root row.
+# Parallel arrays indexed in render order. Each stack starts with its root row
+# at depth 0 (the branch with no open PR, e.g. main); ROOT_OF[i] names the
+# stack root every row belongs to, so multiple stacks can coexist (--yours).
 
-BRANCH=() PARENT=() DEPTH=() STATUS=() NOTE=() AHEAD=()
-RNUM=() RTITLE=() RADDS=() RDELS=() RDRAFT=()
-ROOT="" CUR_BRANCH="" ROOT_BEHIND="?"
+BRANCH=() PARENT=() DEPTH=() STATUS=() NOTE=() AHEAD=() BEHIND=() ROOT_OF=()
+RNUM=() RTITLE=() RADDS=() RDELS=() RDRAFT=() RCHECKS=() RCHECKSCOL=()
+ROOTS=()
+CUR_BRANCH="" CURRENT_ROOT=""
 
 add_row() { # branch parent depth
 	local i=${#BRANCH[@]} b=$1
-	BRANCH[i]=$b PARENT[i]=$2 DEPTH[i]=$3
-	STATUS[i]=idle NOTE[i]="" AHEAD[i]="?"
+	BRANCH[i]=$b PARENT[i]=$2 DEPTH[i]=$3 ROOT_OF[i]=$CURRENT_ROOT
+	STATUS[i]=idle NOTE[i]="" AHEAD[i]="?" BEHIND[i]="?"
 	RNUM[i]=${PR_NUM[$b]:-} RTITLE[i]=${PR_TITLE[$b]:-}
 	RADDS[i]=${PR_ADDS[$b]:-0} RDELS[i]=${PR_DELS[$b]:-0} RDRAFT[i]=${PR_DRAFT[$b]:-false}
+	RCHECKS[i]=${PR_CHECKS[$b]:-} RCHECKSCOL[i]=${PR_CHECKS_COLOR[$b]:-}
 	ROW_OF[$b]=$i
+}
+
+add_root_row() { # branch
+	CURRENT_ROOT=$1
+	ROOT_ROW_OF[$1]=${#BRANCH[@]}
+	ROOTS+=("$1")
+	add_row "$1" "" 0
 }
 
 add_subtree() { # branch depth
@@ -115,24 +209,67 @@ add_subtree() { # branch depth
 	done
 }
 
-build_stack() { # [focus-branch]
+# Default mode: one `gh pr view` for the current branch, then one per ancestor
+# while walking up the bases — instead of listing every open PR in the repo.
+load_stack_current() {
 	CUR_BRANCH=$(git branch --show-current)
-	local focus=${1:-$CUR_BRANCH}
-	[[ -n $focus ]] || die "detached HEAD; check out a branch first"
-	[[ -n ${PR_BASE[$focus]:-} ]] || die "no open pull request found for branch '$focus'"
+	[[ -n $CUR_BRANCH ]] || die "detached HEAD; check out a branch first"
 
-	# Climb to the bottom of the stack: the branch whose base has no open PR.
-	local bottom=$focus
-	while [[ -n ${PR_BASE[${PR_BASE[$bottom]}]:-} ]]; do
-		bottom=${PR_BASE[$bottom]}
+	local fields b=$CUR_BRANCH chain=() line
+	fields=$(pr_fields)
+	while (( ${#chain[@]} < 50 )); do
+		line=$(gh pr view "$b" --json "$fields" 2>/dev/null \
+			| jq -r "${JQ_DEFS}"'select(.state == "OPEN") | row') || line=""
+		[[ -n $line ]] || break
+		ingest_pr_line "$line"
+		chain=("$b" "${chain[@]}")
+		b=${PR_BASE[$b]}
 	done
-	ROOT=${PR_BASE[$bottom]}
+	(( ${#chain[@]} > 0 )) || die "no open pull request found for branch '$CUR_BRANCH'"
 
-	BRANCH=() PARENT=() DEPTH=() STATUS=() NOTE=() AHEAD=()
-	RNUM=() RTITLE=() RADDS=() RDELS=() RDRAFT=()
-	ROW_OF=()
-	add_row "$ROOT" "" 0
-	add_subtree "$bottom" 1
+	add_root_row "$b"
+	local br depth=1
+	for br in "${chain[@]}"; do
+		add_row "$br" "${PR_BASE[$br]}" "$depth"
+		depth=$((depth + 1))
+	done
+}
+
+# --yours: every open PR you authored, grouped into stacks. A base that isn't
+# one of your PRs (main, or someone else's PR branch) becomes a stack root.
+load_stack_yours() {
+	CUR_BRANCH=$(git branch --show-current || true)
+
+	local fields rows line head
+	fields=$(pr_fields)
+	rows=$(gh pr list --author "@me" --state open --limit "$PR_LIMIT" --json "$fields" 2>/dev/null \
+		| jq -r "${JQ_DEFS}"'.[] | row') \
+		|| die "failed to list your pull requests (is 'gh' authenticated for this repo?)"
+
+	local heads=()
+	while IFS= read -r line; do
+		[[ -n $line ]] || continue
+		ingest_pr_line "$line" || continue
+		head=$INGESTED_HEAD
+		heads+=("$head")
+		CHILDREN[${PR_BASE[$head]}]+="$head "
+	done <<<"$rows"
+	(( ${#heads[@]} > 0 )) || die "you have no open pull requests in this repo"
+
+	local h base kid kids
+	declare -A seen_root=()
+	for h in "${heads[@]}"; do
+		base=${PR_BASE[$h]}
+		[[ -n ${PR_BASE[$base]:-} ]] && continue
+		[[ -n ${seen_root[$base]:-} ]] && continue
+		seen_root[$base]=1
+		add_root_row "$base"
+		kids=()
+		read -ra kids <<<"${CHILDREN[$base]}"
+		for kid in "${kids[@]}"; do
+			add_subtree "$kid" 1
+		done
+	done
 }
 
 ref_for() { # branch -> local ref, origin ref, or empty
@@ -150,7 +287,7 @@ load_git_stats() {
 	for (( i = 0; i < ${#BRANCH[@]}; i++ )); do
 		b=${BRANCH[i]} p=${PARENT[i]}
 		if [[ -z $p ]]; then
-			ROOT_BEHIND=$(git rev-list --count "$b..origin/$b" 2>/dev/null || echo "?")
+			BEHIND[i]=$(git rev-list --count "$b..origin/$b" 2>/dev/null || echo "?")
 			continue
 		fi
 		NOTE[i]=""
@@ -167,14 +304,18 @@ load_git_stats() {
 # ── Rebase cascade ───────────────────────────────────────────────────────────
 
 CHAIN=()
+CHAIN_ROOT=""
+CHAIN_ROOT_ROW=0
 CASCADE_ERR=""
 ORIG_BRANCH=""
 declare -A OLD_PARENT_SHA
 
-compute_chain() { # target row index -> CHAIN, bottom row first
+compute_chain() { # target row index -> CHAIN (bottom row first) within its stack
 	CHAIN=()
+	CHAIN_ROOT=${ROOT_OF[$1]}
+	CHAIN_ROOT_ROW=${ROOT_ROW_OF[$CHAIN_ROOT]}
 	local b=${BRANCH[$1]}
-	while [[ -n $b && $b != "$ROOT" ]]; do
+	while [[ -n $b && $b != "$CHAIN_ROOT" ]]; do
 		CHAIN=("${ROW_OF[$b]}" "${CHAIN[@]}")
 		b=${PR_BASE[$b]:-}
 	done
@@ -209,11 +350,11 @@ check_preconditions() {
 
 update_root() {
 	git fetch origin --prune || return 1
-	if [[ $ORIG_BRANCH == "$ROOT" ]]; then
-		git merge --ff-only "origin/$ROOT"
+	if [[ $ORIG_BRANCH == "$CHAIN_ROOT" ]]; then
+		git merge --ff-only "origin/$CHAIN_ROOT"
 	else
 		# Fast-forward-only by definition; fails loudly if local root diverged.
-		git fetch origin "$ROOT:$ROOT"
+		git fetch origin "$CHAIN_ROOT:$CHAIN_ROOT"
 	fi
 }
 
@@ -241,15 +382,15 @@ cascade() { # target-row-index push(1|0)
 
 	# CHAIN is empty when the root itself is the target; ${arr[@]+...} keeps
 	# the expansion safe under `set -u` on bash < 4.4.
-	STATUS[0]=pending
+	STATUS[CHAIN_ROOT_ROW]=pending
 	for r in ${CHAIN[@]+"${CHAIN[@]}"}; do
 		STATUS[$r]=pending
 		NOTE[$r]=""
 	done
 	declare -F convoy_tick >/dev/null && convoy_tick
 
-	if ! convoy_step 0 "updated" update_root; then
-		CASCADE_ERR="could not update $ROOT — local $ROOT has diverged from origin/$ROOT"
+	if ! convoy_step "$CHAIN_ROOT_ROW" "updated" update_root; then
+		CASCADE_ERR="could not update $CHAIN_ROOT — local $CHAIN_ROOT has diverged from origin/$CHAIN_ROOT"
 		return 1
 	fi
 
@@ -324,6 +465,7 @@ cascade() { # target-row-index push(1|0)
 
 PUSH=1
 BASE_DIR=""
+MODE=current
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -340,6 +482,18 @@ while [[ $# -gt 0 ]]; do
 		BASE_DIR=${1#--dir=}
 		shift
 		;;
+	--current)
+		MODE=current
+		shift
+		;;
+	--yours)
+		MODE=yours
+		shift
+		;;
+	--configure)
+		MODE=configure
+		shift
+		;;
 	-h | --help | help)
 		cat <<EOF
 Usage: git convoy [OPTIONS]     (also installed as: git cv)
@@ -350,6 +504,10 @@ Filled radios (●) mark the branches the current selection would rebase;
 empty radios (○) are left untouched.
 
 OPTIONS:
+  --current       Show the current branch's PR and its ancestors (default)
+  --yours         Show all of your open PRs, grouped into stacks
+  --configure     Open the settings UI: toggle the checks column and bind
+                  letter keys to GitHub Actions workflows
   --dir <path>    Run against the git repository at <path> instead of the
                   current directory
   --no-push       Rebase locally only; skip force-pushing
@@ -362,8 +520,13 @@ KEYS:
                   selection is rebased bottom-up and force-pushed (with lease).
                   With the root branch selected, this just pulls it from origin
   c               Check out the selected branch
-  o               Open the selected PR on GitHub
+  v               View the selected PR on GitHub
+  <bound key>     Run the bound GitHub Actions workflow (a-z or 0-9, set up
+                  via --configure) on the selected branch; press again to
+                  open the dispatched run
   q               Quit
+
+Settings are saved per-repo in ~/.git-convoy.json.
 EOF
 		exit 0
 		;;
@@ -382,6 +545,8 @@ fi
 require_deps
 
 REPO_SLUG=$(repo_slug)
+config_load
+
 SPIN_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 SPIN_I=0
 DRAWN=0
@@ -389,6 +554,7 @@ SEL=1
 BUSY=0
 SEL_CHAIN=()
 MESSAGE=""
+INFO=""
 STEP_LOG_TAIL=""
 CUR_PID=""
 LINES=()
@@ -414,9 +580,181 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+# paint: redraw LINES in place (shared by the main and configure views).
+paint() {
+	local out="" line
+	if (( DRAWN > 0 )); then
+		out+=$'\033['"${DRAWN}A"$'\r'
+	fi
+	for line in "${LINES[@]}"; do
+		out+=$'\033[2K'"$line"$'\n'
+	done
+	out+=$'\033[0J'
+	printf '%s' "$out"
+	DRAWN=${#LINES[@]}
+}
+
+# ── Configure view ───────────────────────────────────────────────────────────
+# Letters the main view already uses; they can't be bound to workflows.
+RESERVED_KEYS="jkqrcv"
+
+run_configure() {
+	(( INTERACTIVE )) || die "--configure requires an interactive terminal"
+
+	local WF_ID=() WF_NAME=() rows p n
+	rows=$(gh workflow list --json name,path,state 2>/dev/null \
+		| jq -r '.[] | select(.state == "ACTIVE" or .state == "active") | [.path, .name] | @tsv') || rows=""
+	while IFS=$'\t' read -r p n; do
+		[[ -n $p ]] || continue
+		WF_ID+=("$(basename -- "$p")")
+		WF_NAME+=("${n:-$p}")
+	done <<<"$rows"
+
+	local CSEL=0 CMSG="" last=${#WF_ID[@]}
+
+	key_of_wf() { # workflow-id -> bound key or empty
+		local k
+		for k in ${ACTION_WF[@]+"${!ACTION_WF[@]}"}; do
+			if [[ ${ACTION_WF[$k]} == "$1" ]]; then
+				printf '%s' "$k"
+				return
+			fi
+		done
+	}
+
+	cbuild() {
+		LINES=()
+		LINES+=("")
+		LINES+=("  $(bold "convoy settings")$(dim " · ${REPO_SLUG:-local}")")
+		LINES+=("")
+
+		local cur=" " state
+		(( CSEL == 0 )) && cur=$(bold "$(cyan "❯")")
+		if (( SHOW_CHECKS )); then state=$(green "[on]"); else state=$(dim "[off]"); fi
+		LINES+=("  $cur Show checks $state $(dim "· [passed/total] check status on each PR")")
+		LINES+=("")
+
+		LINES+=("  $(dim "action keys")")
+		if (( ${#WF_ID[@]} == 0 )); then
+			LINES+=("      $(dim "no active workflows found in this repo")")
+		fi
+		local i k disp
+		for (( i = 0; i < ${#WF_ID[@]}; i++ )); do
+			cur=" "
+			(( CSEL == i + 1 )) && cur=$(bold "$(cyan "❯")")
+			k=$(key_of_wf "${WF_ID[i]}")
+			if [[ -n $k ]]; then disp=$(bold "$(cyan "$k")"); else disp=$(dim "—"); fi
+			LINES+=("  $cur $disp  ${WF_NAME[i]} $(dim "· ${WF_ID[i]}")")
+		done
+
+		LINES+=("")
+		LINES+=("  $(dim "↑↓ move · space toggle · a-z 0-9 bind · enter rename · esc unbind · q quit")")
+		if [[ -n $CMSG ]]; then
+			LINES+=("")
+			LINES+=("  $(yellow "$CMSG")")
+		fi
+	}
+
+	crender() {
+		cbuild
+		paint
+	}
+
+	# Rename how a bound action is shown (in the footer and this list); the
+	# name is only stored in the local user's config. Reads one echoed line
+	# below the UI, which paint() then reclaims.
+	rename_selected() {
+		local wf=${WF_ID[CSEL - 1]} k new=""
+		k=$(key_of_wf "$wf")
+		if [[ -z $k ]]; then
+			CMSG="bind a key before renaming"
+			return 0
+		fi
+		printf '\033[?25h'
+		IFS= read -er -p "  rename '${ACTION_NAME[$k]}' to: " new || new=""
+		printf '\033[?25l'
+		DRAWN=$(( DRAWN + 1 ))
+		if [[ -n $new ]]; then
+			ACTION_NAME[$k]=$new
+			WF_NAME[CSEL - 1]=$new
+			config_save
+		fi
+	}
+
+	printf '\033[?25l'
+	crender
+
+	local key rest wf k prev
+	while true; do
+		IFS= read -rsn1 key || break
+		CMSG=""
+		if [[ $key == $'\x1b' ]]; then
+			rest=""
+			read -rsn2 -t 0.01 rest || true
+			key+=$rest
+		fi
+		case "$key" in
+		$'\x1b[A' | k)
+			(( CSEL > 0 )) && CSEL=$(( CSEL - 1 ))
+			crender
+			;;
+		$'\x1b[B' | j)
+			(( CSEL < last )) && CSEL=$(( CSEL + 1 ))
+			crender
+			;;
+		' ' | "")
+			if (( CSEL == 0 )); then
+				SHOW_CHECKS=$(( 1 - SHOW_CHECKS ))
+				config_save
+			elif [[ $key == "" ]]; then
+				rename_selected
+			fi
+			crender
+			;;
+		$'\x1b')
+			if (( CSEL > 0 )); then
+				wf=${WF_ID[CSEL - 1]}
+				k=$(key_of_wf "$wf")
+				if [[ -n $k ]]; then
+					unset "ACTION_WF[$k]" "ACTION_NAME[$k]"
+					config_save
+				fi
+			fi
+			crender
+			;;
+		q)
+			break
+			;;
+		[a-z0-9])
+			if (( CSEL > 0 )); then
+				if [[ $RESERVED_KEYS == *"$key"* ]]; then
+					CMSG="'$key' is reserved ($RESERVED_KEYS)"
+				else
+					wf=${WF_ID[CSEL - 1]}
+					prev=$(key_of_wf "$wf")
+					[[ -n $prev ]] && unset "ACTION_WF[$prev]" "ACTION_NAME[$prev]"
+					# Assigning an already-used key steals it from the other workflow.
+					ACTION_WF[$key]=$wf
+					ACTION_NAME[$key]=${WF_NAME[CSEL - 1]}
+					config_save
+				fi
+			fi
+			crender
+			;;
+		esac
+	done
+}
+
+if [[ $MODE == configure ]]; then
+	run_configure
+	exit 0
+fi
+
+# ── Main view ────────────────────────────────────────────────────────────────
+
 # Radio semantics: filled ● marks rows the current selection would rebase
-# (the root plus the chain up to SEL), the selected row's radio is bold, and
-# everything else is an empty ○. While a rebase runs, idle radios go grey.
+# (the stack root plus the chain up to SEL), the selected row's radio is bold,
+# and everything else is an empty ○. While a rebase runs, idle radios go grey.
 glyph_for() {
 	case "${STATUS[$1]}" in
 	running) cyan "${SPIN_FRAMES:SPIN_I % 10:1}" ;;
@@ -438,16 +776,32 @@ glyph_for() {
 	esac
 }
 
-# Mark the rows a rebase of SEL would touch: the root plus every branch
-# between it and the selection.
+# Mark the rows a rebase of SEL would touch: the stack's root plus every
+# branch between it and the selection.
 mark_sel_chain() {
 	SEL_CHAIN=()
-	SEL_CHAIN[0]=1
+	local root=${ROOT_OF[SEL]:-}
+	[[ -n $root ]] || return 0
+	SEL_CHAIN[${ROOT_ROW_OF[$root]}]=1
 	local b=${BRANCH[SEL]:-}
-	while [[ -n $b && $b != "$ROOT" ]]; do
+	while [[ -n $b && $b != "$root" ]]; do
 		SEL_CHAIN[${ROW_OF[$b]}]=1
 		b=${PR_BASE[$b]:-}
 	done
+}
+
+action_hints() {
+	local out="" k
+	(( ${#ACTION_WF[@]} > 0 )) || return 0
+	while IFS= read -r k; do
+		[[ -n $out ]] && out+=" · "
+		if [[ -n ${ACTION_RUN_ID[$k]:-} ]]; then
+			out+="$k view"
+		else
+			out+="$k ${ACTION_NAME[$k],,}"
+		fi
+	done < <(printf '%s\n' "${!ACTION_WF[@]}" | sort)
+	printf '%s' "$out"
 }
 
 build_lines() {
@@ -458,7 +812,7 @@ build_lines() {
 
 	mark_sel_chain
 
-	local cols i cursor g bname note title meta max ind
+	local cols i cursor g bname checks note title meta max ind
 	cols=$(tput cols 2>/dev/null || echo 120)
 
 	for (( i = 0; i < ${#BRANCH[@]}; i++ )); do
@@ -469,11 +823,12 @@ build_lines() {
 		fi
 
 		if [[ -z ${PARENT[i]} ]]; then
+			(( i > 0 )) && LINES+=("")
 			local behind
-			if [[ $ROOT_BEHIND == "?" ]]; then
+			if [[ ${BEHIND[i]} == "?" ]]; then
 				behind=$(dim "· origin unknown")
-			elif (( ROOT_BEHIND > 0 )); then
-				behind=$(yellow "· $ROOT_BEHIND behind origin")
+			elif (( BEHIND[i] > 0 )); then
+				behind=$(yellow "· ${BEHIND[i]} behind origin")
 			else
 				behind=$(dim "· up to date")
 			fi
@@ -487,9 +842,13 @@ build_lines() {
 		g=$(glyph_for "$i")
 
 		bname=$(cyan "${BRANCH[i]}")
-		if [[ ${BRANCH[i]} == "$CUR_BRANCH" ]]; then
-			bname="$(bold "$(cyan "${BRANCH[i]}")")$(grey " ← you are here")"
+		[[ ${BRANCH[i]} == "$CUR_BRANCH" ]] && bname=$(bold "$(cyan "${BRANCH[i]}")")
+		checks=""
+		if (( SHOW_CHECKS )) && [[ -n ${RCHECKS[i]} ]]; then
+			checks=" $("${RCHECKSCOL[i]}" "[${RCHECKS[i]}]")"
 		fi
+		bname+=$checks
+		[[ ${BRANCH[i]} == "$CUR_BRANCH" ]] && bname+=$(grey " ← you are here")
 		note=""
 		[[ ${RDRAFT[i]} == true ]] && note=" $(yellow "[draft]")"
 		[[ -n ${NOTE[i]} ]] && note+=$(grey " · ${NOTE[i]}")
@@ -505,7 +864,14 @@ build_lines() {
 
 	LINES+=("")
 	if (( INTERACTIVE )); then
-		LINES+=("  $(dim "↑↓ move · r rebase · c checkout · o open pr · q quit")")
+		LINES+=("  $(dim "↑↓ move · r rebase · c checkout · v view on github · q quit")")
+		local hints
+		hints=$(action_hints)
+		[[ -n $hints ]] && LINES+=("  $(dim "$hints")")
+	fi
+	if [[ -n $INFO ]]; then
+		LINES+=("")
+		LINES+=("  $(dim "$INFO")")
 	fi
 	if [[ -n $MESSAGE ]]; then
 		LINES+=("")
@@ -522,16 +888,7 @@ build_lines() {
 
 render() {
 	build_lines
-	local out="" line
-	if (( DRAWN > 0 )); then
-		out+=$'\033['"${DRAWN}A"$'\r'
-	fi
-	for line in "${LINES[@]}"; do
-		out+=$'\033[2K'"$line"$'\n'
-	done
-	out+=$'\033[0J'
-	printf '%s' "$out"
-	DRAWN=${#LINES[@]}
+	paint
 }
 
 # convoy_step: run one cascade step in the background, animating the row's
@@ -570,6 +927,7 @@ convoy_tick() {
 
 start_rebase() {
 	MESSAGE=""
+	INFO=""
 	STEP_LOG_TAIL=""
 	local i
 	for (( i = 0; i < ${#BRANCH[@]}; i++ )); do
@@ -587,6 +945,7 @@ start_rebase() {
 
 checkout_selected() {
 	MESSAGE=""
+	INFO=""
 	local b=${BRANCH[SEL]}
 	if git checkout --quiet "$b" >"$WORKDIR/checkout.log" 2>&1; then
 		CUR_BRANCH=$b
@@ -604,6 +963,46 @@ open_selected_pr() {
 	local num=${RNUM[SEL]:-}
 	[[ -n $num ]] || return 0
 	gh pr view "$num" --web >/dev/null 2>&1 || true
+}
+
+# First press dispatches the bound workflow on the selected row's branch;
+# once a run id is known, the hint flips to "view" and pressing the key again
+# opens that run in the browser.
+run_action_key() {
+	local key=$1 wf=${ACTION_WF[$1]} name=${ACTION_NAME[$1]} ref=${BRANCH[SEL]}
+
+	if [[ -n ${ACTION_RUN_ID[$key]:-} ]]; then
+		gh run view "${ACTION_RUN_ID[$key]}" --web >/dev/null 2>&1 || true
+		return 0
+	fi
+
+	MESSAGE=""
+	STEP_LOG_TAIL=""
+	INFO="dispatching '$name' on ${ref}…"
+	render
+	if ! gh workflow run "$wf" --ref "$ref" >"$WORKDIR/action.log" 2>&1; then
+		INFO=""
+		MESSAGE="failed to dispatch '$name' on $ref"
+		STEP_LOG_TAIL=$(tail -n 6 "$WORKDIR/action.log" 2>/dev/null || true)
+		render
+		return 0
+	fi
+
+	# Dispatch is async; give the run a moment to appear so we can link to it.
+	local id="" try
+	for try in 1 2 3; do
+		sleep 1
+		id=$(gh run list --workflow "$wf" --branch "$ref" --limit 1 \
+			--json databaseId --jq '.[0].databaseId // empty' 2>/dev/null) || id=""
+		[[ -n $id ]] && break
+	done
+	if [[ -n $id ]]; then
+		ACTION_RUN_ID[$key]=$id
+		INFO="'$name' running on $ref — press '$key' again to view"
+	else
+		INFO="'$name' dispatched on $ref"
+	fi
+	render
 }
 
 input_loop() {
@@ -630,25 +1029,36 @@ input_loop() {
 		c)
 			checkout_selected
 			;;
-		o)
+		v)
 			open_selected_pr
 			;;
 		q)
 			break
+			;;
+		*)
+			if [[ ${#key} -eq 1 && -n ${ACTION_WF[$key]:-} ]]; then
+				run_action_key "$key"
+			fi
 			;;
 		esac
 	done
 }
 
 (( INTERACTIVE )) && printf '%s' "$(dim "loading pull requests…")"
-load_prs
+if [[ $MODE == yours ]]; then
+	load_stack_yours
+else
+	load_stack_current
+fi
 (( INTERACTIVE )) && printf '\r\033[2K'
-build_stack
-(( INTERACTIVE )) && printf '%s' "$(dim "fetching origin/${ROOT}…")"
-git fetch origin "$ROOT" --quiet 2>/dev/null || true
+(( INTERACTIVE )) && printf '%s' "$(dim "fetching origin…")"
+for root in "${ROOTS[@]}"; do
+	git fetch origin "$root" --quiet 2>/dev/null || true
+done
 (( INTERACTIVE )) && printf '\r\033[2K'
 load_git_stats
-SEL=${ROW_OF[$CUR_BRANCH]:-1}
+SEL=1
+[[ -n $CUR_BRANCH ]] && SEL=${ROW_OF[$CUR_BRANCH]:-1}
 
 if (( ! INTERACTIVE )); then
 	build_lines

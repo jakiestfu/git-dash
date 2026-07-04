@@ -54,7 +54,9 @@ cd git-convoy
 ## Usage
 
 ```bash
-git cv                       # interactive stack view for the current branch
+git cv                       # current branch's PR and its ancestors (--current)
+git cv --yours               # all of your open PRs, grouped into stacks
+git cv --configure           # settings UI: checks column, action key bindings
 git cv --no-push             # rebase locally only; skip force-pushing
 git cv --dir ./some-repo     # run against another directory's repository
 ```
@@ -62,28 +64,35 @@ git cv --dir ./some-repo     # run against another directory's repository
 `git cv` is an alias for `git convoy`; both names work everywhere. The TUI is
 the whole tool — there are no subcommands.
 
-The view discovers the whole stack from a single `gh pr list` call: it walks
-your branch's PR bases up to the root (the first base with no open PR, e.g.
-`main`), then back down through every PR stacked on top. The root renders at
-the top; each PR sits one level below its parent, indented one space per
-level. Filled radios (`●`) mark the branches the current selection would
-rebase — the root plus every branch between it and the selected row (whose
-radio is bold) — while empty radios (`○`) are left untouched. During a rebase
-all radios grey out until the cascade finishes.
+The default view (`--current`) boots fast: one `gh pr view` for the current
+branch, then one per ancestor while walking the PR bases up to the root (the
+first base with no open PR, e.g. `main`) — it never lists the whole repo's
+PRs. `--yours` instead lists all PRs you authored and groups them into
+stacks; a base that isn't one of your PRs (like `main`, or a teammate's
+branch you stacked on) renders as that stack's root.
+
+The root renders at the top; each PR sits one level below its parent,
+indented one space per level. Filled radios (`●`) mark the branches the
+current selection would rebase — the root plus every branch between it and
+the selected row (whose radio is bold) — while empty radios (`○`) are left
+untouched. During a rebase all radios grey out until the cascade finishes.
 
 ```
   convoy · turo/web-schumacher-app
 
     ● main · 2 behind origin
-     ● feat/set-phone-number
+     ● feat/set-phone-number [5/5]
        #14397 Set phone number  +881 −0 · 2 ahead
-      ● feat/managed-vehicles-onboarding
+      ● feat/managed-vehicles-onboarding [3/5]
         #14331 Owner onboarding  +1464 −115 · 5 ahead
-     ❯ ● feat/managed-vehicles-groups ← you are here
+     ❯ ● feat/managed-vehicles-groups [2/3] ← you are here
          #14402 Managed groups dashboard  +1130 −53 · 3 ahead
 
-  ↑↓ move · r rebase · c checkout · o open pr · q quit
+  ↑↓ move · r rebase · c checkout · v view on github · q quit
+  i translations - integrate · p translations - push
 ```
+
+Bound action keys (here `i` and `p`) get their own footer line.
 
 ## Keys
 
@@ -91,10 +100,50 @@ all radios grey out until the cascade finishes.
 - `r` — rebase the selected PR's chain (see below); with the root branch
   selected, this just pulls it from origin
 - `c` — check out the selected branch
-- `o` — open the selected PR on GitHub
+- `v` — view the selected PR on GitHub
+- any bound action key (see `--configure`) — dispatch that GitHub Actions
+  workflow on the selected branch; once the run is up the hint flips to
+  `<key> view` and pressing it again opens the run in the browser
 - `q` — quit
 
 The root branch (e.g. `main`) is selectable like any other row.
+
+## Checks
+
+Each PR row shows `[passed/total]` for its checks, colored the way GitHub
+would show it: red if any check failed, yellow if any is still pending,
+green when everything passed. The counts come from the same `gh` calls that
+load the PRs, so they cost nothing extra. Toggle the column off in
+`--configure` ("Show checks", on by default).
+
+## Configure
+
+`git cv --configure` opens the settings UI:
+
+- **Show checks** — toggle the `[passed/total]` column with `space`/`enter`.
+- **Action keys** — every active GitHub Actions workflow in the repo is
+  listed. Select one and press a letter or digit (`a-z`, `0-9`) to bind it
+  (`t` on "Upload Translations" makes `t` dispatch that workflow from the
+  main view); pressing a different key rebinds it, binding a key already in
+  use steals it from the other workflow, and `esc` unbinds. `enter` renames
+  the bound action — the name only lives in your local config, so shorten
+  away. The letters `j k q r c v` are reserved for the main view.
+
+Settings are saved per-repo in `~/.git-convoy.json`:
+
+```json
+{
+  "version": 1,
+  "repos": {
+    "owner/repo": {
+      "showChecks": true,
+      "actions": {
+        "t": { "workflow": "upload-translations.yml", "name": "Upload Translations" }
+      }
+    }
+  }
+}
+```
 
 ## Rebasing
 
