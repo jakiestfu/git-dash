@@ -5,8 +5,6 @@ GITHUB_REPO="${GIT_CONVOY_REPO:-jakiestfu/git-convoy}"
 GITHUB_REF="${GIT_CONVOY_REF:-main}"
 INSTALL_DIR="${PREFIX:-$HOME/.local/bin}"
 
-SUBCOMMANDS=(_lib refresh view)
-
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 gray() { printf '\033[90m%s\033[0m\n' "$*"; }
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -28,21 +26,7 @@ fi
 bold "Installing git-convoy to $INSTALL_DIR"
 gray "  source: $MODE${MODE:+ ($GITHUB_REPO@$GITHUB_REF)}"
 
-mkdir -p "$INSTALL_DIR/git-convoy.d"
-
-install_local() {
-	gray "  Installing git-convoy dispatcher"
-	cp -f "$SCRIPT_DIR/bin/git-convoy" "$INSTALL_DIR/git-convoy"
-	chmod +x "$INSTALL_DIR/git-convoy"
-
-	for sub in "$SCRIPT_DIR/libexec/git-convoy.d"/*; do
-		[[ -f "$sub" ]] || continue
-		name="$(basename -- "$sub")"
-		gray "  Installing git-convoy.d/$name"
-		cp -f "$sub" "$INSTALL_DIR/git-convoy.d/$name"
-		chmod +x "$INSTALL_DIR/git-convoy.d/$name"
-	done
-}
+mkdir -p "$INSTALL_DIR"
 
 fetch() {
 	local url=$1 dest=$2
@@ -56,33 +40,20 @@ fetch() {
 	fi
 }
 
-install_remote() {
-	local base="https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF"
-	local tmp
-	tmp=$(mktemp -d -t git-convoy-install.XXXXXX)
-	trap 'rm -rf "$tmp"' RETURN
-
-	gray "  Downloading git-convoy dispatcher"
-	fetch "$base/bin/git-convoy" "$tmp/git-convoy"
-
-	for name in "${SUBCOMMANDS[@]}"; do
-		gray "  Downloading git-convoy.d/$name"
-		fetch "$base/libexec/git-convoy.d/$name" "$tmp/$name"
-	done
-
-	mv "$tmp/git-convoy" "$INSTALL_DIR/git-convoy"
-	chmod +x "$INSTALL_DIR/git-convoy"
-	for name in "${SUBCOMMANDS[@]}"; do
-		mv "$tmp/$name" "$INSTALL_DIR/git-convoy.d/$name"
-		chmod +x "$INSTALL_DIR/git-convoy.d/$name"
-	done
-}
-
 if [[ "$MODE" == local ]]; then
-	install_local
+	gray "  Installing git-convoy"
+	cp -f "$SCRIPT_DIR/bin/git-convoy" "$INSTALL_DIR/git-convoy"
 else
-	install_remote
+	gray "  Downloading git-convoy"
+	tmp=$(mktemp -d -t git-convoy-install.XXXXXX)
+	trap 'rm -rf "$tmp"' EXIT
+	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/bin/git-convoy" "$tmp/git-convoy"
+	mv "$tmp/git-convoy" "$INSTALL_DIR/git-convoy"
 fi
+chmod +x "$INSTALL_DIR/git-convoy"
+
+# Remove the subcommand directory left behind by older versions.
+rm -rf "$INSTALL_DIR/git-convoy.d"
 
 gray "  Installing git-cv alias"
 ln -sf "$INSTALL_DIR/git-convoy" "$INSTALL_DIR/git-cv"
