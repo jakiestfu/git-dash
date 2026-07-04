@@ -466,6 +466,7 @@ cascade() { # target-row-index push(1|0)
 PUSH=1
 BASE_DIR=""
 MODE=current
+CONFIG_IMPORT=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -493,6 +494,15 @@ while [[ $# -gt 0 ]]; do
 	--configure)
 		MODE=configure
 		shift
+		if [[ $# -gt 0 && ${1:0:1} != - ]]; then
+			CONFIG_IMPORT=$1
+			shift
+		fi
+		;;
+	--configure=*)
+		MODE=configure
+		CONFIG_IMPORT=${1#--configure=}
+		shift
 		;;
 	-h | --help | help)
 		cat <<EOF
@@ -506,8 +516,12 @@ empty radios (○) are left untouched.
 OPTIONS:
   --current       Show the current branch's PR and its ancestors (default)
   --yours         Show all of your open PRs, grouped into stacks
-  --configure     Open the settings UI: toggle the checks column and bind
-                  letter keys to GitHub Actions workflows
+  --configure [URL]
+                  Open the settings UI: toggle the checks column and bind
+                  keys to GitHub Actions workflows. With a URL (or local
+                  path) to a shared JSON file, its action bindings are
+                  downloaded and merged into this repo's config first —
+                  handy for sharing team configurations
   --dir <path>    Run against the git repository at <path> instead of the
                   current directory
   --no-push       Rebase locally only; skip force-pushing
@@ -598,8 +612,53 @@ paint() {
 # Letters the main view already uses; they can't be bound to workflows.
 RESERVED_KEYS="jkqrcv"
 
+# import_actions: fetch a shared JSON file (URL or local path) and merge its
+# action bindings into this repo's config. The file may be a full config
+# (bindings read from .repos["owner/repo"].actions) or a bare fragment with a
+# top-level "actions" object. Imported bindings win over local ones — both
+# for the same key and for the same workflow — and reserved keys are skipped.
+import_actions() { # url-or-path
+	local src=$1 file="$WORKDIR/import.json"
+
+	if [[ -f $src ]]; then
+		cp -- "$src" "$file"
+	elif command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$src" -o "$file" || die "could not download '$src'"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$file" "$src" || die "could not download '$src'"
+	else
+		die "need curl or wget to download '$src'"
+	fi
+	jq empty "$file" 2>/dev/null || die "'$src' is not valid JSON"
+
+	local imported=0 skipped="" key wf name k
+	while IFS=$'\t' read -r key wf name; do
+		[[ -n $key && -n $wf ]] || continue
+		if [[ ${#key} -ne 1 || $RESERVED_KEYS == *"$key"* ]]; then
+			skipped+=" $key"
+			continue
+		fi
+		# Same stealing semantics as the configure UI: one key per workflow.
+		for k in ${ACTION_WF[@]+"${!ACTION_WF[@]}"}; do
+			[[ ${ACTION_WF[$k]} == "$wf" ]] && unset "ACTION_WF[$k]" "ACTION_NAME[$k]"
+		done
+		ACTION_WF[$key]=$wf
+		ACTION_NAME[$key]=${name:-$wf}
+		imported=$(( imported + 1 ))
+	done < <(jq -r --arg r "$REPO_SLUG" \
+		'(.repos[$r].actions // .actions // {})
+		 | to_entries[] | [.key, .value.workflow, .value.name] | @tsv' \
+		"$file" 2>/dev/null || true)
+
+	(( imported > 0 )) || die "no usable action bindings found in '$src'"
+	config_save
+	printf '%s\n' "$(green "imported $imported action binding(s) from $src")"
+	[[ -n $skipped ]] && printf '%s\n' "$(yellow "skipped reserved/invalid key(s):$skipped")"
+	return 0
+}
+
 run_configure() {
-	(( INTERACTIVE )) || die "--configure requires an interactive terminal"
+	(( INTERACTIVE )) || die "--configure requires an interactive terminal (or a URL to import)"
 
 	local WF_ID=() WF_NAME=() rows p n
 	rows=$(gh workflow list --json name,path,state 2>/dev/null \
@@ -746,7 +805,10 @@ run_configure() {
 }
 
 if [[ $MODE == configure ]]; then
-	run_configure
+	[[ -n $CONFIG_IMPORT ]] && import_actions "$CONFIG_IMPORT"
+	if (( INTERACTIVE )) || [[ -z $CONFIG_IMPORT ]]; then
+		run_configure
+	fi
 	exit 0
 fi
 

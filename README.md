@@ -129,6 +129,27 @@ load the PRs, so they cost nothing extra. Toggle the column off in
   the bound action — the name only lives in your local config, so shorten
   away. The letters `j k q r c v` are reserved for the main view.
 
+### Sharing team configurations
+
+`git cv --configure <url>` downloads a JSON file (a URL or a local path) and
+merges its action bindings into this repo's config before opening the UI —
+in a non-interactive shell it just merges and prints a summary. Imported
+bindings win over your local ones; reserved keys are skipped. The file can
+be a full config (bindings are read from `repos["owner/repo"].actions`) or a
+repo-agnostic fragment:
+
+```json
+{
+  "actions": {
+    "i": { "workflow": "translations-integrate.yml", "name": "translations - integrate" },
+    "p": { "workflow": "translations-push.yml", "name": "translations - push" }
+  }
+}
+```
+
+Check that fragment into your repo or a gist, and teammates pick it up with
+one command.
+
 Settings are saved per-repo in `~/.git-convoy.json`:
 
 ```json
