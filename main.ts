@@ -699,7 +699,7 @@ function parseArgs(args: string[]): void {
 
 const SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 let SPIN_I = 0;
-let DRAWN = 0;
+let SEL_LINE = 0;
 let SEL = 1;
 let BUSY = false;
 let SEL_CHAIN = new Set<number>();
@@ -710,9 +710,24 @@ let LINES: string[] = [];
 
 const INTERACTIVE = Deno.stdin.isTerminal() && Deno.stdout.isTerminal();
 let RAW = false;
+let ALT = false;
 
 function write(s: string): void {
   Deno.stdout.writeSync(new TextEncoder().encode(s));
+}
+
+// The interactive views run on the terminal's alternate screen buffer, so
+// they own the full window height and leave the scrollback untouched on exit.
+function enterAltScreen(): void {
+  if (!INTERACTIVE || ALT) return;
+  write("\x1b[?1049h\x1b[?25l");
+  ALT = true;
+}
+
+function exitAltScreen(): void {
+  if (!ALT) return;
+  write("\x1b[?25h\x1b[?1049l");
+  ALT = false;
 }
 
 function setRaw(on: boolean): void {
@@ -724,6 +739,7 @@ function setRaw(on: boolean): void {
 
 async function cleanup(): Promise<void> {
   if (INTERACTIVE) {
+    exitAltScreen();
     write("\x1b[?25h");
     setRaw(false);
   }
@@ -736,16 +752,26 @@ async function cleanup(): Promise<void> {
   await restoreBranch();
 }
 
-// paint: redraw LINES in place (shared by the main and configure views).
+// paint: redraw LINES on the alternate screen from the top-left (shared by
+// the main and configure views). When LINES is taller than the window, a
+// scroll window keeps SEL_LINE visible.
 function paint(): void {
-  let out = "";
-  if (DRAWN > 0) out += `\x1b[${DRAWN}A\r`;
-  for (const line of LINES) {
-    out += `\x1b[2K${line}\n`;
+  const rows = termRows();
+  let top = 0;
+  if (LINES.length > rows) {
+    top = Math.max(
+      0,
+      Math.min(SEL_LINE - Math.floor(rows / 2), LINES.length - rows),
+    );
+  }
+  const view = LINES.slice(top, top + rows);
+  let out = "\x1b[H";
+  for (let i = 0; i < view.length; i++) {
+    out += `\x1b[2K${view[i]}`;
+    if (i < view.length - 1) out += "\n";
   }
   out += "\x1b[0J";
   write(out);
-  DRAWN = LINES.length;
 }
 
 function termCols(): number {
@@ -753,6 +779,14 @@ function termCols(): number {
     return Deno.consoleSize().columns;
   } catch {
     return 120;
+  }
+}
+
+function termRows(): number {
+  try {
+    return Deno.consoleSize().rows;
+  } catch {
+    return 40;
   }
 }
 
@@ -900,7 +934,10 @@ async function runConfigure(): Promise<void> {
     LINES.push("");
 
     let cur = " ";
-    if (CSEL === 0) cur = bold(cyan("❯"));
+    if (CSEL === 0) {
+      cur = bold(cyan("❯"));
+      SEL_LINE = LINES.length;
+    }
     const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
     LINES.push(
       `  ${cur} Show checks ${state} ${
@@ -915,7 +952,10 @@ async function runConfigure(): Promise<void> {
     }
     for (let i = 0; i < workflows.length; i++) {
       cur = " ";
-      if (CSEL === i + 1) cur = bold(cyan("❯"));
+      if (CSEL === i + 1) {
+        cur = bold(cyan("❯"));
+        SEL_LINE = LINES.length;
+      }
       const k = keyOfWf(workflows[i].id);
       const disp = k ? bold(cyan(k)) : dim("—");
       LINES.push(
@@ -953,7 +993,6 @@ async function runConfigure(): Promise<void> {
       return;
     }
     const newName = await readLine(`  rename '${ACTIONS.get(k)!.name}' to: `);
-    DRAWN += 1;
     if (newName) {
       ACTIONS.get(k)!.name = newName;
       wf.name = newName;
@@ -961,7 +1000,7 @@ async function runConfigure(): Promise<void> {
     }
   };
 
-  write("\x1b[?25l");
+  enterAltScreen();
   crender();
 
   loop: while (true) {
@@ -1091,6 +1130,7 @@ function buildLines(): void {
     let cursor = " ";
     if (INTERACTIVE && i === SEL) {
       cursor = BUSY ? grey("❯") : bold(cyan("❯"));
+      SEL_LINE = LINES.length;
     }
 
     if (!row.parent) {
@@ -1250,11 +1290,26 @@ async function runActionKey(key: string): Promise<void> {
 
   MESSAGE = "";
   STEP_LOG_TAIL = "";
-  INFO = `dispatching '${name}' on ${ref}…`;
-  render();
+  INFO = "";
+
+  // While the dispatch runs, the selected row shows a spinner and the rest of
+  // the view is greyed out (BUSY); the sequential input loop blocks keys.
+  ROWS[SEL].status = "running";
+  BUSY = true;
+  const timer = setInterval(() => {
+    SPIN_I += 1;
+    render();
+  }, 80);
+
+  const finish = (status: RowStatus) => {
+    clearInterval(timer);
+    BUSY = false;
+    ROWS[SEL].status = status;
+  };
+
   const r = await run("gh", ["workflow", "run", wf, "--ref", ref]);
   if (r.code !== 0) {
-    INFO = "";
+    finish("fail");
     MESSAGE = `failed to dispatch '${name}' on ${ref}`;
     STEP_LOG_TAIL = tailLines(r.stdout + r.stderr, 6);
     render();
@@ -1284,6 +1339,7 @@ async function runActionKey(key: string): Promise<void> {
     }
     if (id) break;
   }
+  finish("idle");
   if (id) {
     ACTION_RUN_ID.set(key, id);
     INFO = `'${name}' running on ${ref} — press '${key}' again to view`;
@@ -1368,10 +1424,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  write("\x1b[?25l");
+  enterAltScreen();
   setRaw(true);
   render();
   await inputLoop();
+}
+
+if (INTERACTIVE && Deno.build.os !== "windows") {
+  Deno.addSignalListener("SIGWINCH", () => {
+    if (ALT) paint();
+  });
 }
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -1382,12 +1444,15 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
 }
 
 let exitCode = 0;
+let fatal = "";
 try {
   await main();
 } catch (e) {
-  console.error(e instanceof Error ? e.message : String(e));
+  // Printed after cleanup(), so leaving the alternate screen can't erase it.
+  fatal = e instanceof Error ? e.message : String(e);
   exitCode = 1;
 } finally {
   await cleanup();
 }
+if (fatal) console.error(fatal);
 Deno.exit(exitCode);
