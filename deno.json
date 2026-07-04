@@ -1,7 +1,14 @@
 {
   "tasks": {
-    "check": "deno check bin/git-convoy.ts",
-    "run": "deno run --ext=ts --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net bin/git-convoy",
-    "compile": "deno compile --ext=ts --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net --output dist/git-convoy bin/git-convoy"
+    "check": "deno check main.ts",
+    "fmt": "deno fmt",
+    "run": "deno run --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net main.ts",
+    "compile": "deno compile --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net --output dist/git-convoy main.ts"
+  },
+  "fmt": {
+    "exclude": ["dist/"]
+  },
+  "lint": {
+    "exclude": ["dist/"]
   }
 }

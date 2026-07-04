@@ -223,7 +223,8 @@ function ingestPr(pr: any): string {
 }
 
 function prFields(): string {
-  let f = "number,title,headRefName,baseRefName,additions,deletions,isDraft,state";
+  let f =
+    "number,title,headRefName,baseRefName,additions,deletions,isDraft,state";
   if (SHOW_CHECKS) f += ",statusCheckRollup";
   return f;
 }
@@ -349,13 +350,17 @@ async function loadStackYours(): Promise<void> {
     prFields(),
   ]);
   if (raw === null) {
-    die("failed to list your pull requests (is 'gh' authenticated for this repo?)");
+    die(
+      "failed to list your pull requests (is 'gh' authenticated for this repo?)",
+    );
   }
   let prs;
   try {
     prs = JSON.parse(raw);
   } catch {
-    die("failed to list your pull requests (is 'gh' authenticated for this repo?)");
+    die(
+      "failed to list your pull requests (is 'gh' authenticated for this repo?)",
+    );
   }
 
   const heads: string[] = [];
@@ -381,13 +386,16 @@ async function loadStackYours(): Promise<void> {
 }
 
 async function refExists(ref: string): Promise<boolean> {
-  return (await tryOut("git", ["rev-parse", "--verify", "--quiet", ref])) !== null;
+  return (await tryOut("git", ["rev-parse", "--verify", "--quiet", ref])) !==
+    null;
 }
 
 // branch -> local ref, origin ref, or empty
 async function refFor(branch: string): Promise<string> {
   if (await refExists(`refs/heads/${branch}`)) return branch;
-  if (await refExists(`refs/remotes/origin/${branch}`)) return `origin/${branch}`;
+  if (await refExists(`refs/remotes/origin/${branch}`)) {
+    return `origin/${branch}`;
+  }
   return "";
 }
 
@@ -532,7 +540,8 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
     if (!(await refExists(`refs/heads/${b}`))) {
       if ((await tryOut("git", ["fetch", "origin", `${b}:${b}`])) === null) {
         ROWS[r].status = "fail";
-        CASCADE_ERR = `branch '${b}' has no local copy and could not be fetched`;
+        CASCADE_ERR =
+          `branch '${b}' has no local copy and could not be fetched`;
         return false;
       }
       ROWS[r].note = "fetched";
@@ -571,8 +580,11 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
       const bSha = await tryOut("git", ["rev-parse", b]);
       const originSha = await tryOut("git", ["rev-parse", `origin/${b}`]);
       if (push && bSha !== originSha) {
-        const ok = await convoyStep(r, "pushed", () =>
-          x("git", ["push", "--force-with-lease", "origin", b]));
+        const ok = await convoyStep(
+          r,
+          "pushed",
+          () => x("git", ["push", "--force-with-lease", "origin", b]),
+        );
         if (!ok) {
           CASCADE_ERR = `push of '${b}' failed`;
           await restoreBranch();
@@ -834,7 +846,9 @@ async function importActions(src: string): Promise<void> {
   if (imported === 0) die(`no usable action bindings found in '${src}'`);
   configSave();
   console.log(green(`imported ${imported} action binding(s) from ${src}`));
-  if (skipped) console.log(yellow(`skipped reserved/invalid key(s):${skipped}`));
+  if (skipped) {
+    console.log(yellow(`skipped reserved/invalid key(s):${skipped}`));
+  }
 }
 
 async function runConfigure(): Promise<void> {
@@ -847,7 +861,12 @@ async function runConfigure(): Promise<void> {
     name: string;
   }
   const workflows: Workflow[] = [];
-  const raw = await tryOut("gh", ["workflow", "list", "--json", "name,path,state"]);
+  const raw = await tryOut("gh", [
+    "workflow",
+    "list",
+    "--json",
+    "name,path,state",
+  ]);
   if (raw !== null) {
     try {
       for (const wf of JSON.parse(raw)) {
@@ -875,14 +894,18 @@ async function runConfigure(): Promise<void> {
   const cbuild = () => {
     LINES = [];
     LINES.push("");
-    LINES.push(`  ${bold("convoy settings")}${dim(` · ${REPO_SLUG || "local"}`)}`);
+    LINES.push(
+      `  ${bold("convoy settings")}${dim(` · ${REPO_SLUG || "local"}`)}`,
+    );
     LINES.push("");
 
     let cur = " ";
     if (CSEL === 0) cur = bold(cyan("❯"));
     const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
     LINES.push(
-      `  ${cur} Show checks ${state} ${dim("· [passed/total] check status on each PR")}`,
+      `  ${cur} Show checks ${state} ${
+        dim("· [passed/total] check status on each PR")
+      }`,
     );
     LINES.push("");
 
@@ -895,12 +918,18 @@ async function runConfigure(): Promise<void> {
       if (CSEL === i + 1) cur = bold(cyan("❯"));
       const k = keyOfWf(workflows[i].id);
       const disp = k ? bold(cyan(k)) : dim("—");
-      LINES.push(`  ${cur} ${disp}  ${workflows[i].name} ${dim(`· ${workflows[i].id}`)}`);
+      LINES.push(
+        `  ${cur} ${disp}  ${workflows[i].name} ${dim(`· ${workflows[i].id}`)}`,
+      );
     }
 
     LINES.push("");
     LINES.push(
-      `  ${dim("↑↓ move · space toggle · a-z 0-9 bind · enter rename · esc unbind · q quit")}`,
+      `  ${
+        dim(
+          "↑↓ move · space toggle · a-z 0-9 bind · enter rename · esc unbind · q quit",
+        )
+      }`,
     );
     if (CMSG) {
       LINES.push("");
@@ -1106,7 +1135,9 @@ function buildLines(): void {
 
   LINES.push("");
   if (INTERACTIVE) {
-    LINES.push(`  ${dim("↑↓ move · r rebase · c checkout · v view on github · q quit")}`);
+    LINES.push(
+      `  ${dim("↑↓ move · r rebase · c checkout · v view on github · q quit")}`,
+    );
     const hints = actionHints();
     if (hints) LINES.push(`  ${dim(hints)}`);
   }

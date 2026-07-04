@@ -17,7 +17,7 @@ else
 	SCRIPT_DIR=""
 fi
 
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/bin/git-convoy" ]]; then
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/main.ts" ]]; then
 	MODE=local
 else
 	MODE=remote
@@ -42,12 +42,12 @@ fetch() {
 
 if [[ "$MODE" == local ]]; then
 	gray "  Installing git-convoy"
-	cp -f "$SCRIPT_DIR/bin/git-convoy" "$INSTALL_DIR/git-convoy"
+	cp -f "$SCRIPT_DIR/main.ts" "$INSTALL_DIR/git-convoy"
 else
 	gray "  Downloading git-convoy"
 	tmp=$(mktemp -d -t git-convoy-install.XXXXXX)
 	trap 'rm -rf "$tmp"' EXIT
-	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/bin/git-convoy" "$tmp/git-convoy"
+	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/main.ts" "$tmp/git-convoy"
 	mv "$tmp/git-convoy" "$INSTALL_DIR/git-convoy"
 fi
 chmod +x "$INSTALL_DIR/git-convoy"

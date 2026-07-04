@@ -17,6 +17,8 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+      - run: deno fmt --check
+      - run: deno lint
       - run: deno task check
 
   release:
@@ -36,11 +38,11 @@ jobs:
             aarch64-unknown-linux-gnu \
             x86_64-apple-darwin \
             aarch64-apple-darwin; do
-            deno compile --ext=ts \
+            deno compile \
               --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net \
               --target "$target" \
               --output "dist/git-convoy-$target" \
-              bin/git-convoy
+              main.ts
           done
       - name: Create release
         env:

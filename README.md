@@ -1,8 +1,8 @@
 # git convoy
 
-Interactive terminal tool for managing stacked GitHub pull requests — a line
-of PRs following the lead, whether that's one branch against `main` or a
-three-deep stack.
+Interactive terminal tool for managing stacked GitHub pull requests — a line of
+PRs following the lead, whether that's one branch against `main` or a three-deep
+stack.
 
 ## Install
 
@@ -32,8 +32,7 @@ To install somewhere else:
 PREFIX=/usr/local/bin ./install.sh
 ```
 
-If `~/.local/bin` is not on your `PATH`, add this to `~/.zshrc` or
-`~/.bashrc`:
+If `~/.local/bin` is not on your `PATH`, add this to `~/.zshrc` or `~/.bashrc`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -45,8 +44,8 @@ Re-running `./install.sh` is safe — it overwrites in place.
 
 - `git`
 - [`gh`](https://cli.github.com), authenticated
-- [Deno](https://deno.com) 2.x (not needed if you install a prebuilt binary
-  from Releases)
+- [Deno](https://deno.com) 2.x (not needed if you install a prebuilt binary from
+  Releases)
 
 ## Developing
 
@@ -56,14 +55,30 @@ cd git-convoy
 ./install.sh
 
 deno task check      # type-check
-deno task compile    # build a standalone binary into dist/
+deno task fmt        # format (deno fmt)
+deno task run        # run from source
+deno task compile    # build a standalone binary into dist/git-convoy
 ```
 
-The tool is a single TypeScript file, `bin/git-convoy`, run directly by Deno
-via its shebang (`bin/git-convoy.ts` is a symlink to it for editors and
-`deno check`). Tagging a release (`git tag v1.x.y && git push --tags`) makes
-CI compile binaries for Linux and macOS (x86_64 and arm64) and attach them to
-a GitHub release.
+The tool is a single TypeScript file, `main.ts`, run directly by Deno via its
+shebang; the installer copies it into place as `git-convoy`, and
+`deno task compile` builds the real binary into `dist/`. Tagging a release
+(`git tag v1.x.y && git push --tags`) makes CI compile binaries for Linux and
+macOS (x86_64 and arm64) and attach them to a GitHub release.
+
+### Editor setup
+
+Deno's types (`Deno.*` globals) come from the Deno language server, not from an
+npm package — there's nothing to install. If your editor reports
+`Cannot find name 'Deno'`, it's using the plain TypeScript server: install the
+[Deno extension](https://marketplace.visualstudio.com/items?itemName=denoland.vscode-deno)
+for VS Code (this repo's `.vscode/settings.json` already enables it), or enable
+the Deno LSP in your editor of choice.
+
+This project has no third-party dependencies at all — the standard-library-only
+runtime API covers everything. If it ever needs one, Deno pulls dependencies
+straight from [JSR](https://jsr.io) or npm via `deno add`, recorded in
+`deno.json` — there's no `node_modules` to manage.
 
 ## Usage
 
@@ -80,16 +95,16 @@ the whole tool — there are no subcommands.
 
 The default view (`--current`) boots fast: one `gh pr view` for the current
 branch, then one per ancestor while walking the PR bases up to the root (the
-first base with no open PR, e.g. `main`) — it never lists the whole repo's
-PRs. `--yours` instead lists all PRs you authored and groups them into
-stacks; a base that isn't one of your PRs (like `main`, or a teammate's
-branch you stacked on) renders as that stack's root.
+first base with no open PR, e.g. `main`) — it never lists the whole repo's PRs.
+`--yours` instead lists all PRs you authored and groups them into stacks; a base
+that isn't one of your PRs (like `main`, or a teammate's branch you stacked on)
+renders as that stack's root.
 
-The root renders at the top; each PR sits one level below its parent,
-indented one space per level. Filled radios (`●`) mark the branches the
-current selection would rebase — the root plus every branch between it and
-the selected row (whose radio is bold) — while empty radios (`○`) are left
-untouched. During a rebase all radios grey out until the cascade finishes.
+The root renders at the top; each PR sits one level below its parent, indented
+one space per level. Filled radios (`●`) mark the branches the current selection
+would rebase — the root plus every branch between it and the selected row (whose
+radio is bold) — while empty radios (`○`) are left untouched. During a rebase
+all radios grey out until the cascade finishes.
 
 ```
   convoy · turo/web-schumacher-app
@@ -124,45 +139,48 @@ The root branch (e.g. `main`) is selectable like any other row.
 
 ## Checks
 
-Each PR row shows `[passed/total]` for its checks, colored the way GitHub
-would show it: red if any check failed, yellow if any is still pending,
-green when everything passed. The counts come from the same `gh` calls that
-load the PRs, so they cost nothing extra. Toggle the column off in
-`--configure` ("Show checks", on by default).
+Each PR row shows `[passed/total]` for its checks, colored the way GitHub would
+show it: red if any check failed, yellow if any is still pending, green when
+everything passed. The counts come from the same `gh` calls that load the PRs,
+so they cost nothing extra. Toggle the column off in `--configure` ("Show
+checks", on by default).
 
 ## Configure
 
 `git cv --configure` opens the settings UI:
 
 - **Show checks** — toggle the `[passed/total]` column with `space`/`enter`.
-- **Action keys** — every active GitHub Actions workflow in the repo is
-  listed. Select one and press a letter or digit (`a-z`, `0-9`) to bind it
-  (`t` on "Upload Translations" makes `t` dispatch that workflow from the
-  main view); pressing a different key rebinds it, binding a key already in
-  use steals it from the other workflow, and `esc` unbinds. `enter` renames
-  the bound action — the name only lives in your local config, so shorten
-  away. The letters `j k q r c v` are reserved for the main view.
+- **Action keys** — every active GitHub Actions workflow in the repo is listed.
+  Select one and press a letter or digit (`a-z`, `0-9`) to bind it (`t` on
+  "Upload Translations" makes `t` dispatch that workflow from the main view);
+  pressing a different key rebinds it, binding a key already in use steals it
+  from the other workflow, and `esc` unbinds. `enter` renames the bound action —
+  the name only lives in your local config, so shorten away. The letters
+  `j k q r c v` are reserved for the main view.
 
 ### Sharing team configurations
 
 `git cv --configure <url>` downloads a JSON file (a URL or a local path) and
-merges its action bindings into this repo's config before opening the UI —
-in a non-interactive shell it just merges and prints a summary. Imported
-bindings win over your local ones; reserved keys are skipped. The file can
-be a full config (bindings are read from `repos["owner/repo"].actions`) or a
-repo-agnostic fragment:
+merges its action bindings into this repo's config before opening the UI — in a
+non-interactive shell it just merges and prints a summary. Imported bindings win
+over your local ones; reserved keys are skipped. The file can be a full config
+(bindings are read from `repos["owner/repo"].actions`) or a repo-agnostic
+fragment:
 
 ```json
 {
   "actions": {
-    "i": { "workflow": "translations-integrate.yml", "name": "translations - integrate" },
+    "i": {
+      "workflow": "translations-integrate.yml",
+      "name": "translations - integrate"
+    },
     "p": { "workflow": "translations-push.yml", "name": "translations - push" }
   }
 }
 ```
 
-Check that fragment into your repo or a gist, and teammates pick it up with
-one command.
+Check that fragment into your repo or a gist, and teammates pick it up with one
+command.
 
 Settings are saved per-repo in `~/.git-convoy.json`:
 
@@ -173,7 +191,10 @@ Settings are saved per-repo in `~/.git-convoy.json`:
     "owner/repo": {
       "showChecks": true,
       "actions": {
-        "t": { "workflow": "upload-translations.yml", "name": "Upload Translations" }
+        "t": {
+          "workflow": "upload-translations.yml",
+          "name": "Upload Translations"
+        }
       }
     }
   }
@@ -192,9 +213,9 @@ Safety properties:
 - Refuses to start on a dirty tree, detached HEAD, an in-progress rebase, or
   when any branch in the chain has remote commits you don't have locally.
 - Each branch's fork point is recorded before anything moves, so rebases use
-  `git rebase --onto <new-parent> <old-fork-point> <branch>` and never replay
-  a parent's commits as duplicates.
+  `git rebase --onto <new-parent> <old-fork-point> <branch>` and never replay a
+  parent's commits as duplicates.
 - On conflict the rebase is aborted, the row turns ✗, the cascade stops, and
-  your original branch is checked back out. Already-completed branches were
-  each rebased *and* pushed, so a partial rebase is safe to resume by
-  pressing `r` again.
+  your original branch is checked back out. Already-completed branches were each
+  rebased _and_ pushed, so a partial rebase is safe to resume by pressing `r`
+  again.
