@@ -4,102 +4,37 @@
 
 const PR_LIMIT = 100;
 
-// ── Colors ───────────────────────────────────────────────────────────────────
+// ── Imports ──────────────────────────────────────────────────────────────────
 
-const USE_COLOR = Deno.stdout.isTerminal() && !Deno.env.get("NO_COLOR");
-
-function c(code: string, s: string): string {
-  return USE_COLOR ? `\x1b[${code}m${s}\x1b[0m` : s;
-}
-const red = (s: string) => c("31", s);
-const green = (s: string) => c("32", s);
-const yellow = (s: string) => c("33", s);
-const cyan = (s: string) => c("36", s);
-const grey = (s: string) => c("90", s);
-const dim = (s: string) => c("2", s);
-const bold = (s: string) => c("1", s);
-
-function die(msg: string): never {
-  console.error(USE_COLOR ? `\x1b[31m${msg}\x1b[0m` : msg);
-  Deno.exit(1);
-}
-
-// ── Subprocesses ─────────────────────────────────────────────────────────────
-
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-let curChild: Deno.ChildProcess | null = null;
-
-async function run(cmd: string, args: string[]): Promise<RunResult> {
-  const child = new Deno.Command(cmd, {
-    args,
-    stdin: "null",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  curChild = child;
-  try {
-    const out = await child.output();
-    return {
-      code: out.code,
-      stdout: new TextDecoder().decode(out.stdout),
-      stderr: new TextDecoder().decode(out.stderr),
-    };
-  } finally {
-    curChild = null;
-  }
-}
-
-// out: stdout on success, or null on failure.
-async function tryOut(cmd: string, args: string[]): Promise<string | null> {
-  try {
-    const r = await run(cmd, args);
-    return r.code === 0 ? r.stdout.replace(/\n$/, "") : null;
-  } catch {
-    return null;
-  }
-}
-
-class StepError extends Error {
-  log: string;
-  constructor(log: string) {
-    super("step failed");
-    this.log = log;
-  }
-}
-
-// x: run a cascade step command; throws StepError with combined output on
-// failure (the log tail is shown under the failed row).
-async function x(cmd: string, args: string[]): Promise<void> {
-  const r = await run(cmd, args);
-  if (r.code !== 0) throw new StepError(r.stdout + r.stderr);
-}
-
-async function requireDeps(): Promise<void> {
-  for (const cmd of ["git", "gh"]) {
-    if ((await tryOut(cmd, ["--version"])) === null) {
-      die(`git convoy requires '${cmd}'`);
-    }
-  }
-  if ((await tryOut("git", ["rev-parse", "--git-dir"])) === null) {
-    die("not a git repository");
-  }
-}
-
-export function normalizeRepoUrl(url: string): string {
-  return url.replace(/\.git$/, "")
-    .replace(/^git@github\.com:/, "")
-    .replace(/^https:\/\/github\.com\//, "");
-}
-
-async function repoSlug(): Promise<string> {
-  const url = await tryOut("git", ["remote", "get-url", "origin"]);
-  return url ? normalizeRepoUrl(url) : "";
-}
+import {
+  applyColorPreference,
+  bold,
+  cyan,
+  die,
+  dim,
+  green,
+  grey,
+  red,
+  yellow,
+} from "./colors.ts";
+import {
+  killCurrentChild,
+  repoSlug,
+  requireDeps,
+  run,
+  StepError,
+  tryOut,
+  x,
+} from "./subprocess.ts";
+import {
+  boxed,
+  formatBranchLine,
+  formatMetaLine,
+  tailLines,
+  viewTop,
+  visibleWidth,
+} from "./format.ts";
+import { type CliOptions, type Mode, parseArgs } from "./cli.ts";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 // Per-repo settings live in one JSON file in the user's home directory:
@@ -216,7 +151,10 @@ function saveStackCache(): void {
   const next = {
     ...base,
     version: 1,
-    stacks: { ...(base.stacks ?? {}), [cacheKey()]: { curBranch: CUR_BRANCH, rows } },
+    stacks: {
+      ...(base.stacks ?? {}),
+      [cacheKey()]: { curBranch: CUR_BRANCH, rows },
+    },
   };
   try {
     const tmp = `${CACHE_FILE}.tmp-${Deno.pid}`;
@@ -894,92 +832,13 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
   return true;
 }
 
-// ── CLI ──────────────────────────────────────────────────────────────────────
+// ── CLI state ──────────────────────────────────────────────────────────────
+// Parsing lives in cli.ts; main() applies the parsed options into these.
 
 let PUSH = true;
 let BASE_DIR = "";
-let MODE: "current" | "yours" | "all" | "org" | "configure" = "current";
+let MODE: Mode = "current";
 let CONFIG_IMPORT = "";
-
-const HELP = `Usage: git convoy [OPTIONS]     (also installed as: git cv)
-
-Interactive view of the PR stack containing the current branch. The root
-branch renders at the top; each PR below it, indented one space per level.
-Filled radios (●) mark the branches the current selection would rebase;
-empty radios (○) are left untouched.
-
-The session has two tabs — Stack and Settings — switched with Tab / Shift-Tab.
-
-OPTIONS:
-  --current       Show the current branch's PR and its ancestors (default)
-  --yours         Show all of your open PRs in this repo, grouped into stacks
-  --all           Show all of your open PRs across every repo, grouped by repo.
-                  A read-only overview (no rebase/checkout/checks — those need a
-                  local clone); press enter to open a PR on GitHub
-  --org           Like --all, but limited to the current repo's organization
-  --configure [URL]
-                  Open the session onto the Settings tab: toggle the checks
-                  column and the PR detail line, set the auto-refresh interval,
-                  and bind keys to GitHub Actions workflows. Tab switches to the
-                  Stack tab from there. With a URL (or local path) to a shared
-                  JSON file, its action bindings are downloaded and merged into
-                  this repo's config first — handy for sharing team configs
-  --dir <path>    Run against the git repository at <path> instead of the
-                  current directory
-  --no-push       Rebase locally only; skip force-pushing
-  -h, --help      Show this help message
-
-Keys are shown in-app: the footer lists the actions for the current selection,
-and the header shows the Stack / Settings tabs. Settings are saved per-repo in
-~/.git-convoy.json.`;
-
-function parseArgs(args: string[]): void {
-  let i = 0;
-  while (i < args.length) {
-    const arg = args[i];
-    if (arg === "--no-push") {
-      PUSH = false;
-      i += 1;
-    } else if (arg === "--dir") {
-      if (i + 1 >= args.length) die("--dir requires a path");
-      BASE_DIR = args[i + 1];
-      i += 2;
-    } else if (arg.startsWith("--dir=")) {
-      BASE_DIR = arg.slice("--dir=".length);
-      i += 1;
-    } else if (arg === "--current") {
-      MODE = "current";
-      i += 1;
-    } else if (arg === "--yours") {
-      MODE = "yours";
-      i += 1;
-    } else if (arg === "--all") {
-      MODE = "all";
-      i += 1;
-    } else if (arg === "--org") {
-      MODE = "org";
-      i += 1;
-    } else if (arg === "--configure") {
-      MODE = "configure";
-      i += 1;
-      if (i < args.length && !args[i].startsWith("-")) {
-        CONFIG_IMPORT = args[i];
-        i += 1;
-      }
-    } else if (arg.startsWith("--configure=")) {
-      MODE = "configure";
-      CONFIG_IMPORT = arg.slice("--configure=".length);
-      i += 1;
-    } else if (arg === "-h" || arg === "--help" || arg === "help") {
-      console.log(HELP);
-      Deno.exit(0);
-    } else {
-      console.log(`Unknown option: ${arg}`);
-      console.log("Run 'git convoy --help' for usage information");
-      Deno.exit(1);
-    }
-  }
-}
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
 
@@ -1052,75 +911,6 @@ function headerStatus(): string {
   return dim(lead ? `${lead} · q quit` : "q quit");
 }
 
-// visibleWidth: printed column count of a string, ignoring ANSI SGR codes.
-// Good enough for the ASCII/box content we render (no wide CJK).
-// deno-lint-ignore no-control-regex
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-// deno-lint-ignore no-control-regex
-const ANSI_HEAD_RE = /^\x1b\[[0-9;]*m/;
-export function visibleWidth(s: string): number {
-  return s.replace(ANSI_RE, "").length;
-}
-
-// truncateVisible: cut a string to at most `width` printed columns, keeping
-// ANSI SGR codes intact (they cost no width) and appending an ellipsis when
-// something was dropped. Used to guarantee box content fits its border.
-export function truncateVisible(s: string, width: number): string {
-  if (visibleWidth(s) <= width) return s;
-  if (width <= 0) return "";
-  let out = "";
-  let w = 0;
-  let i = 0;
-  const budget = width - 1; // leave a column for the ellipsis
-  while (i < s.length && w < budget) {
-    const m = s.slice(i).match(ANSI_HEAD_RE);
-    if (m) {
-      out += m[0];
-      i += m[0].length;
-      continue;
-    }
-    out += s[i];
-    i += 1;
-    w += 1;
-  }
-  // Carry any trailing reset codes so color never leaks past the cut.
-  const rest = s.slice(i).match(ANSI_RE);
-  if (rest) out += rest.join("");
-  return out + "…";
-}
-
-// boxed: wrap content lines in a rounded border with a title in the top edge:
-//   ╭─ title ────────────╮
-//   │ content            │
-//   ╰────────────────────╯
-// Each returned line is prefixed with `indent` spaces. `inner` is the content
-// width between the one-space border padding; content lines are padded
-// (accounting for ANSI codes) so the right border stays aligned. Every border
-// glyph is dimmed. The span between the corners is `inner + 2` in every row.
-export function boxed(
-  title: string,
-  content: string[],
-  inner: number,
-  indent = "  ",
-): string[] {
-  const b = (s: string) => dim(s);
-  // Top edge: "─ title " then dashes filling the rest of the span. The span
-  // (columns between the corners) grows to fit the title so every row lines up.
-  const label = title ? `─ ${title} ` : "";
-  const span = Math.max(inner + 2, visibleWidth(label) + 1);
-  const bodyInner = span - 2; // content width once the title is accounted for
-  const topFill = Math.max(span - visibleWidth(label), 0);
-  const out: string[] = [];
-  out.push(`${indent}${b("╭")}${b(label)}${b("─".repeat(topFill))}${b("╮")}`);
-  for (const raw of content) {
-    const line = truncateVisible(raw, bodyInner);
-    const pad = Math.max(bodyInner - visibleWidth(line), 0);
-    out.push(`${indent}${b("│")} ${line}${" ".repeat(pad)} ${b("│")}`);
-  }
-  out.push(`${indent}${b("╰")}${b("─".repeat(span))}${b("╯")}`);
-  return out;
-}
-
 const INTERACTIVE = Deno.stdin.isTerminal() && Deno.stdout.isTerminal();
 let RAW = false;
 let ALT = false;
@@ -1157,25 +947,14 @@ async function cleanup(): Promise<void> {
     write("\x1b[?25h");
     setRaw(false);
   }
-  try {
-    curChild?.kill();
-  } catch {
-    // already exited
-  }
+  killCurrentChild();
   await abortRebaseIfAny();
   await restoreBranch();
 }
 
 // paint: redraw the screen (shared by the main and configure views). HEADER is
 // pinned to the top rows and FOOTER to the bottom; LINES scrolls in the space
-// between them, keeping SEL_LINE visible.
-// viewTop: first visible line index — 0 while everything fits, otherwise
-// centered on the selection and clamped to the ends of the content.
-export function viewTop(total: number, rows: number, selLine: number): number {
-  if (total <= rows) return 0;
-  return Math.max(0, Math.min(selLine - Math.floor(rows / 2), total - rows));
-}
-
+// between them (viewTop, from format.ts, keeps SEL_LINE visible).
 function paint(): void {
   const rows = termRows();
   // Header and footer eat into the window from the top and bottom; on tiny
@@ -1215,11 +994,6 @@ function termRows(): number {
   } catch {
     return 40;
   }
-}
-
-export function tailLines(s: string, n: number): string {
-  const lines = s.replace(/\n$/, "").split("\n");
-  return lines.slice(-n).join("\n");
 }
 
 // decodeKeys: split raw input into key names. Escape sequences arrive as one
@@ -1340,13 +1114,13 @@ function keyOfWf(wfId: string): string {
 // Sample PR rendered through the same formatters as the stack view, so
 // toggling a setting shows exactly what it changes.
 const SETTINGS_PREVIEW = {
-  branch: "feat/set-phone-number",
+  branch: "feat/api-client",
   checks: "47/48",
   checksColor: "yellow",
-  num: "14397",
-  title: "feat(set-phone-number): generic set/verify mobile phone flow",
-  adds: 881,
-  dels: 0,
+  num: "128",
+  title: "feat(api-client): typed client with ret/verify request flow",
+  adds: 412,
+  dels: 18,
   ahead: "2",
 };
 
@@ -1602,71 +1376,6 @@ function actionHints(): string {
     }
   }
   return parts.join(" · ");
-}
-
-function colorFn(name: string): (s: string) => string {
-  switch (name) {
-    case "green":
-      return green;
-    case "yellow":
-      return yellow;
-    case "red":
-      return red;
-    default:
-      return (s) => s;
-  }
-}
-
-// formatBranchLine / formatMetaLine: the two lines every PR row renders as.
-// Shared by the main view and the configure preview so they can't drift.
-// With showPr off there is no meta line, so the delta moves onto the branch
-// line instead.
-export function formatDelta(
-  pr: { adds: number; dels: number; ahead: string },
-): string {
-  return `${green(`+${pr.adds}`)} ${red(`−${pr.dels}`)}${
-    dim(` · ${pr.ahead} ahead`)
-  }`;
-}
-
-// The current branch is marked with a trailing asterisk; rows whose checks
-// can be drilled into get a ▸ (▾ once expanded) after the checks badge.
-export function formatBranchLine(
-  pr: {
-    branch: string;
-    checks: string;
-    checksColor: string;
-    adds: number;
-    dels: number;
-    ahead: string;
-  },
-  opts: {
-    showChecks: boolean;
-    showPr: boolean;
-    current: boolean;
-    expand?: "open" | "closed";
-  },
-): string {
-  const name = opts.current ? `${pr.branch}*` : pr.branch;
-  let bname = opts.current ? bold(cyan(name)) : cyan(name);
-  if (opts.showChecks && pr.checks) {
-    bname += ` ${colorFn(pr.checksColor)(`[${pr.checks}]`)}`;
-    if (opts.expand) bname += ` ${dim(opts.expand === "open" ? "▾" : "▸")}`;
-  }
-  if (!opts.showPr) bname += ` ${formatDelta(pr)}`;
-  return bname;
-}
-
-export function formatMetaLine(
-  pr: { num: string; title: string; adds: number; dels: number; ahead: string },
-  cols: number,
-  indent: number,
-): string {
-  let title = pr.title;
-  let max = cols - indent - 32;
-  if (max < 12) max = 12;
-  if (title.length > max) title = title.slice(0, max - 1) + "…";
-  return `${dim(`#${pr.num}`)} ${title}  ${formatDelta(pr)}`;
 }
 
 // buildHeader: the pinned top rows shared by both tabs — a blank spacer, the
@@ -2161,10 +1870,41 @@ async function inputLoop(): Promise<void> {
   }
 }
 
+// ── Upgrade ──────────────────────────────────────────────────────────────────
+
+// runUpgrade: emit the install one-liner so it can be piped to a shell
+// (`git cv upgrade | bash`). Printing rather than spawning a shell keeps the
+// tool from needing run permission for bash. When stdout is a terminal we add
+// a short instruction; when piped, only the bare command is written.
+function runUpgrade(): never {
+  const repo = Deno.env.get("GIT_CONVOY_REPO") ?? "jakiestfu/git-convoy";
+  const ref = Deno.env.get("GIT_CONVOY_REF") ?? "main";
+  const oneLiner =
+    `curl -fsSL https://raw.githubusercontent.com/${repo}/${ref}/install.sh | bash`;
+  if (Deno.stdout.isTerminal()) {
+    console.log(dim("Update git-convoy by running:\n"));
+    console.log(`  ${oneLiner}\n`);
+    console.log(dim("Or in one step:  git cv upgrade | bash"));
+  } else {
+    // Piped (`git cv upgrade | bash`): emit only the command to execute.
+    console.log(oneLiner);
+  }
+  Deno.exit(0);
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  parseArgs(Deno.args);
+  // Gate color on TTY/NO_COLOR before any output (incl. parse-time errors).
+  applyColorPreference();
+  const opts: CliOptions = parseArgs(Deno.args);
+  PUSH = opts.push;
+  BASE_DIR = opts.baseDir;
+  MODE = opts.mode;
+  CONFIG_IMPORT = opts.configImport;
+
+  // `upgrade` is a standalone command — it doesn't need a git repo or gh.
+  if (MODE === "upgrade") runUpgrade();
 
   if (BASE_DIR) {
     try {
