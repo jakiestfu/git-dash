@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --quiet --ext=ts --allow-run=git,gh --allow-read --allow-write --allow-env --allow-net
+#!/usr/bin/env -S deno run --quiet --ext=ts --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net
 // git convoy — interactive TUI for managing stacked GitHub pull requests.
 // Installed as both `git-convoy` and `git-cv`. Runs on Deno 2.x.
 
@@ -104,6 +104,8 @@ async function repoSlug(): Promise<string> {
 // ── Config ───────────────────────────────────────────────────────────────────
 // Per-repo settings live in one JSON file in the user's home directory:
 //   { "repos": { "owner/repo": { "showChecks": true,
+//                                "showPr": true,
+//                                "autoRefresh": 30,
 //                                "actions": { "t": { "workflow": "x.yml",
 //                                                    "name": "X" } } } } }
 
@@ -115,7 +117,24 @@ interface ActionBinding {
 const CONFIG_FILE = Deno.env.get("GIT_CONVOY_CONFIG") ??
   `${Deno.env.get("HOME")}/.git-convoy.json`;
 let SHOW_CHECKS = true;
+let SHOW_PR = true; // PR number/title line under each branch
+let AUTO_REFRESH = 0; // seconds between auto-refreshes; 0 = off
 let ACTIONS = new Map<string, ActionBinding>();
+
+// Auto-refresh cycles through these intervals (seconds; 0 = off).
+export const AUTO_REFRESH_STEPS = [0, 30, 60, 300];
+
+export function nextAutoRefresh(cur: number): number {
+  const i = AUTO_REFRESH_STEPS.indexOf(cur);
+  return AUTO_REFRESH_STEPS[(i + 1) % AUTO_REFRESH_STEPS.length];
+}
+
+export function formatCountdown(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return s ? `${m}m${s}s` : `${m}m`;
+}
 const ACTION_RUN_ID = new Map<string, string>();
 let REPO_SLUG = "";
 
@@ -131,10 +150,16 @@ function readJsonFile(path: string): any | null {
 function configLoad(): void {
   ACTIONS = new Map();
   SHOW_CHECKS = true;
+  SHOW_PR = true;
+  AUTO_REFRESH = 0;
   if (!REPO_SLUG) return;
   const repo = readJsonFile(CONFIG_FILE)?.repos?.[REPO_SLUG];
   if (!repo) return;
   if (repo.showChecks === false) SHOW_CHECKS = false;
+  if (repo.showPr === false) SHOW_PR = false;
+  if (AUTO_REFRESH_STEPS.includes(repo.autoRefresh)) {
+    AUTO_REFRESH = repo.autoRefresh;
+  }
   for (const [key, val] of Object.entries(repo.actions ?? {})) {
     const v = val as Partial<ActionBinding>;
     if (!key || !v?.workflow) continue;
@@ -152,7 +177,12 @@ function configSave(): void {
     version: 1,
     repos: {
       ...(base.repos ?? {}),
-      [REPO_SLUG]: { showChecks: SHOW_CHECKS, actions },
+      [REPO_SLUG]: {
+        showChecks: SHOW_CHECKS,
+        showPr: SHOW_PR,
+        autoRefresh: AUTO_REFRESH,
+        actions,
+      },
     },
   };
   const tmp = `${CONFIG_FILE}.tmp-${Deno.pid}`;
@@ -160,10 +190,95 @@ function configSave(): void {
   Deno.renameSync(tmp, CONFIG_FILE);
 }
 
+// ── Stack cache ────────────────────────────────────────────────────────────
+// The last-loaded stack is cached to disk per repo+mode so a relaunch paints
+// the previous rows instantly (marked stale) while the live data reloads in
+// place. The cache holds the rendered rows plus the current branch; PR fields
+// live on the rows themselves, so no separate PR map is stored.
+
+const CACHE_FILE = Deno.env.get("GIT_CONVOY_CACHE") ??
+  `${Deno.env.get("HOME")}/.git-convoy-cache.json`;
+
+interface CachedStack {
+  curBranch: string;
+  rows: Row[];
+}
+
+function cacheKey(): string {
+  return `${REPO_SLUG}#${MODE}`;
+}
+
+function saveStackCache(): void {
+  if (!REPO_SLUG || ROWS.length === 0) return;
+  const base = readJsonFile(CACHE_FILE) ?? {};
+  // Drop transient per-run fields (spinner status, step notes) from the cache.
+  const rows = ROWS.map((r) => ({ ...r, status: "idle", note: "" }));
+  const next = {
+    ...base,
+    version: 1,
+    stacks: { ...(base.stacks ?? {}), [cacheKey()]: { curBranch: CUR_BRANCH, rows } },
+  };
+  try {
+    const tmp = `${CACHE_FILE}.tmp-${Deno.pid}`;
+    Deno.writeTextFileSync(tmp, JSON.stringify(next));
+    Deno.renameSync(tmp, CACHE_FILE);
+  } catch {
+    // cache is best-effort; ignore write failures
+  }
+}
+
+function loadStackCache(): CachedStack | null {
+  if (!REPO_SLUG) return null;
+  const c = readJsonFile(CACHE_FILE)?.stacks?.[cacheKey()];
+  if (!c || !Array.isArray(c.rows) || c.rows.length === 0) return null;
+  return c as CachedStack;
+}
+
+// restoreRows: rebuild ROWS and its indexes (and the PRS base map that the
+// chain math reads) from a set of rows — used for both the disk cache and the
+// in-place refresh snapshot.
+function restoreRows(rows: Row[]): void {
+  PRS.clear();
+  CHILDREN.clear();
+  ROWS.length = 0;
+  ROW_OF.clear();
+  ROOT_ROW_OF.clear();
+  ROOTS.length = 0;
+  for (const r of rows) {
+    const row: Row = { ...r, checkItems: r.checkItems ?? [], url: r.url ?? "" };
+    ROW_OF.set(row.branch, ROWS.length);
+    if (!row.parent) {
+      ROOT_ROW_OF.set(row.branch, ROWS.length);
+      ROOTS.push(row.branch);
+    } else {
+      // The chain walkers read PRS.get(branch).base; only base is needed here.
+      PRS.set(row.branch, {
+        base: row.parent,
+        num: row.num,
+        adds: row.adds,
+        dels: row.dels,
+        title: row.title,
+        draft: row.draft,
+        checks: row.checks,
+        checksColor: row.checksColor,
+        items: row.checkItems,
+        url: row.url,
+      });
+    }
+    ROWS.push(row);
+  }
+}
+
 // ── PR data ──────────────────────────────────────────────────────────────────
 // Both loaders fetch PRs via `gh --json` and fold statusCheckRollup down to
 // "passed/total" plus a GitHub-style color: red if any check failed, else
 // yellow if any is still pending, else green.
+
+export interface CheckItem {
+  name: string;
+  state: "pass" | "fail" | "pending";
+  url: string;
+}
 
 interface PrInfo {
   base: string;
@@ -174,6 +289,10 @@ interface PrInfo {
   draft: boolean;
   checks: string;
   checksColor: string;
+  items: CheckItem[];
+  // Direct PR URL — only needed in --all mode, where rows live in other repos
+  // and can't be opened with `gh pr view <num>` against the current repo.
+  url?: string;
 }
 
 const PRS = new Map<string, PrInfo>();
@@ -215,10 +334,36 @@ export function summarizeChecks(
   return { checks, checksColor };
 }
 
+// extractCheckItems: keep each rollup entry's name, pass/fail/pending state,
+// and details link so the expanded checks list can render and open them.
+// Failed checks sort first (then pending, then passed) so the ones worth
+// drilling into sit at the top of the expanded list.
+const CHECK_ORDER = { fail: 0, pending: 1, pass: 2 } as const;
+
+export function extractCheckItems(rollup: unknown[]): CheckItem[] {
+  const items = rollup.map((raw) => {
+    // deno-lint-ignore no-explicit-any
+    const ch = raw as any;
+    const v = verdict(ch);
+    return {
+      name: String(ch.name ?? ch.context ?? "check"),
+      state: PASSING.has(v)
+        ? "pass" as const
+        : FAILING.has(v)
+        ? "fail" as const
+        : "pending" as const,
+      url: String(ch.detailsUrl ?? ch.targetUrl ?? ""),
+    };
+  });
+  return items.sort((a, b) => CHECK_ORDER[a.state] - CHECK_ORDER[b.state]);
+}
+
+// prInfoOf: fold one raw `gh` PR object into the PrInfo we store.
 // deno-lint-ignore no-explicit-any
-function ingestPr(pr: any): string {
-  const { checks, checksColor } = summarizeChecks(pr.statusCheckRollup ?? []);
-  PRS.set(pr.headRefName, {
+function prInfoOf(pr: any): PrInfo {
+  const rollup = pr.statusCheckRollup ?? [];
+  const { checks, checksColor } = summarizeChecks(rollup);
+  return {
     base: pr.baseRefName,
     num: String(pr.number),
     adds: pr.additions ?? 0,
@@ -227,8 +372,8 @@ function ingestPr(pr: any): string {
     draft: pr.isDraft === true,
     checks,
     checksColor,
-  });
-  return pr.headRefName;
+    items: extractCheckItems(rollup),
+  };
 }
 
 function prFields(): string {
@@ -261,6 +406,12 @@ interface Row {
   draft: boolean;
   checks: string;
   checksColor: string;
+  checkItems: CheckItem[];
+  // Direct PR URL, set in --all mode; empty for same-repo rows.
+  url: string;
+  // Display name for the row's first line. Defaults to `branch`; --all sets it
+  // to the PR title since those rows have no local branch to name.
+  display?: string;
 }
 
 const ROWS: Row[] = [];
@@ -289,7 +440,22 @@ function addRow(branch: string, parent: string, depth: number): void {
     draft: pr?.draft ?? false,
     checks: pr?.checks ?? "",
     checksColor: pr?.checksColor ?? "",
+    checkItems: pr?.items ?? [],
+    url: pr?.url ?? "",
   });
+}
+
+// resetStack: clear all stack state. Loaders call this at the moment they
+// begin building rows (not before their slow network walk) so any previously
+// shown rows — a cache or the last refresh — stay on screen until fresh data
+// is ready to replace them in one burst.
+function resetStack(): void {
+  PRS.clear();
+  CHILDREN.clear();
+  ROWS.length = 0;
+  ROW_OF.clear();
+  ROOT_ROW_OF.clear();
+  ROOTS.length = 0;
 }
 
 function addRootRow(branch: string): void {
@@ -308,15 +474,22 @@ function addSubtree(branch: string, depth: number): void {
 
 // Default mode: one `gh pr view` for the current branch, then one per ancestor
 // while walking up the bases — instead of listing every open PR in the repo.
-async function loadStackCurrent(): Promise<void> {
+// onStep (if given) is called after each `gh` round-trip so the caller can
+// keep the loading indicator live.
+async function loadStackCurrent(onStep?: () => void): Promise<void> {
   CUR_BRANCH = (await tryOut("git", ["branch", "--show-current"])) ?? "";
-  if (!CUR_BRANCH) die("detached HEAD; check out a branch first");
+  if (!CUR_BRANCH) throw new Error("detached HEAD; check out a branch first");
+  onStep?.();
 
+  // Walk the PRs into a scratch map first, so the current view (a cache or the
+  // last data) stays on screen until we have a full replacement.
   const fields = prFields();
+  const walked = new Map<string, PrInfo>();
   let b = CUR_BRANCH;
   const chain: string[] = [];
   while (chain.length < 50) {
     const raw = await tryOut("gh", ["pr", "view", b, "--json", fields]);
+    onStep?.();
     if (raw === null) break;
     let pr;
     try {
@@ -325,14 +498,16 @@ async function loadStackCurrent(): Promise<void> {
       break;
     }
     if (pr.state !== "OPEN") break;
-    ingestPr(pr);
+    walked.set(pr.headRefName, prInfoOf(pr));
     chain.unshift(b);
-    b = PRS.get(b)!.base;
+    b = walked.get(b)!.base;
   }
   if (chain.length === 0) {
-    die(`no open pull request found for branch '${CUR_BRANCH}'`);
+    throw new Error(`no open pull request found for branch '${CUR_BRANCH}'`);
   }
 
+  resetStack();
+  for (const [k, v] of walked) PRS.set(k, v);
   addRootRow(b);
   let depth = 1;
   for (const br of chain) {
@@ -359,7 +534,7 @@ async function loadStackYours(): Promise<void> {
     prFields(),
   ]);
   if (raw === null) {
-    die(
+    throw new Error(
       "failed to list your pull requests (is 'gh' authenticated for this repo?)",
     );
   }
@@ -367,19 +542,30 @@ async function loadStackYours(): Promise<void> {
   try {
     prs = JSON.parse(raw);
   } catch {
-    die(
+    throw new Error(
       "failed to list your pull requests (is 'gh' authenticated for this repo?)",
     );
   }
 
+  // Fold into scratch first, then swap the stack state in one burst so any
+  // currently shown rows (cache/last data) aren't cleared until we're ready.
+  const walked = new Map<string, PrInfo>();
+  const kids = new Map<string, string[]>();
   const heads: string[] = [];
   for (const pr of prs) {
-    const head = ingestPr(pr);
+    const head = pr.headRefName;
+    walked.set(head, prInfoOf(pr));
     heads.push(head);
-    const base = PRS.get(head)!.base;
-    CHILDREN.set(base, [...(CHILDREN.get(base) ?? []), head]);
+    const base = walked.get(head)!.base;
+    kids.set(base, [...(kids.get(base) ?? []), head]);
   }
-  if (heads.length === 0) die("you have no open pull requests in this repo");
+  if (heads.length === 0) {
+    throw new Error("you have no open pull requests in this repo");
+  }
+
+  resetStack();
+  for (const [k, v] of walked) PRS.set(k, v);
+  for (const [k, v] of kids) CHILDREN.set(k, v);
 
   const seenRoot = new Set<string>();
   for (const h of heads) {
@@ -392,6 +578,95 @@ async function loadStackYours(): Promise<void> {
       addSubtree(kid, 1);
     }
   }
+}
+
+// --all / --org: every open PR you authored, grouped by repo. Uses `gh search
+// prs` (cross-repo), which exposes far fewer fields than `gh pr view` — no base
+// branch, diff size, or checks — so this is a read-only overview: each repo is
+// a root row, its PRs the children (opened with enter). Rebase/checkout don't
+// apply since the PRs live outside the current repo. With --org the search is
+// scoped to the current repo's organization (the owner in owner/repo).
+async function loadStackAll(): Promise<void> {
+  CUR_BRANCH = (await tryOut("git", ["branch", "--show-current"])) ?? "";
+
+  const args = [
+    "search",
+    "prs",
+    "--author",
+    "@me",
+    "--state",
+    "open",
+    "--limit",
+    String(PR_LIMIT),
+    "--json",
+    "number,title,repository,url,isDraft",
+  ];
+  if (MODE === "org") {
+    const owner = REPO_SLUG.split("/")[0];
+    if (!owner) throw new Error("could not determine the current repo's org");
+    args.push("--owner", owner);
+  }
+  const raw = await tryOut("gh", args);
+  if (raw === null) throw new Error("failed to search your pull requests");
+  let prs;
+  try {
+    prs = JSON.parse(raw);
+  } catch {
+    throw new Error("failed to search your pull requests");
+  }
+  if (!Array.isArray(prs) || prs.length === 0) {
+    throw new Error(
+      MODE === "org"
+        ? `you have no open pull requests in ${REPO_SLUG.split("/")[0]}`
+        : "you have no open pull requests",
+    );
+  }
+
+  // Group PRs by repo (owner/name), preserving first-seen order.
+  const byRepo = new Map<string, PrInfo[]>();
+  for (const pr of prs) {
+    const repo = String(pr.repository?.nameWithOwner ?? "unknown");
+    const info: PrInfo = {
+      base: repo,
+      num: String(pr.number),
+      adds: 0,
+      dels: 0,
+      title: pr.title ?? "",
+      draft: pr.isDraft === true,
+      checks: "",
+      checksColor: "",
+      items: [],
+      url: pr.url ?? "",
+    };
+    byRepo.set(repo, [...(byRepo.get(repo) ?? []), info]);
+  }
+
+  resetStack();
+  for (const [repo, list] of byRepo) {
+    addRootRow(repo);
+    for (const info of list) {
+      // A synthetic per-repo key keeps rows unique even if PR branches collide;
+      // the row's display name is the PR title (there's no branch to show).
+      const key = `${repo}#${info.num}`;
+      PRS.set(key, info);
+      addRow(key, repo, 1);
+      ROWS[ROWS.length - 1].display = info.title || `#${info.num}`;
+    }
+  }
+}
+
+// isOverview: --all / --org are read-only cross-repo overviews (PRs live
+// outside the working dir), so rebase/checkout/checks/git-stats don't apply.
+function isOverview(): boolean {
+  return MODE === "all" || MODE === "org";
+}
+
+// loadStack: dispatch to the loader for the current MODE. onStep, if given, is
+// forwarded to loaders that report per-round-trip progress.
+function loadStack(onStep?: () => void): Promise<void> {
+  if (MODE === "yours") return loadStackYours();
+  if (isOverview()) return loadStackAll();
+  return loadStackCurrent(onStep);
 }
 
 async function refExists(ref: string): Promise<boolean> {
@@ -623,7 +898,7 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
 
 let PUSH = true;
 let BASE_DIR = "";
-let MODE: "current" | "yours" | "configure" = "current";
+let MODE: "current" | "yours" | "all" | "org" | "configure" = "current";
 let CONFIG_IMPORT = "";
 
 const HELP = `Usage: git convoy [OPTIONS]     (also installed as: git cv)
@@ -633,34 +908,30 @@ branch renders at the top; each PR below it, indented one space per level.
 Filled radios (●) mark the branches the current selection would rebase;
 empty radios (○) are left untouched.
 
+The session has two tabs — Stack and Settings — switched with Tab / Shift-Tab.
+
 OPTIONS:
   --current       Show the current branch's PR and its ancestors (default)
-  --yours         Show all of your open PRs, grouped into stacks
+  --yours         Show all of your open PRs in this repo, grouped into stacks
+  --all           Show all of your open PRs across every repo, grouped by repo.
+                  A read-only overview (no rebase/checkout/checks — those need a
+                  local clone); press enter to open a PR on GitHub
+  --org           Like --all, but limited to the current repo's organization
   --configure [URL]
-                  Open the settings UI: toggle the checks column and bind
-                  keys to GitHub Actions workflows. With a URL (or local
-                  path) to a shared JSON file, its action bindings are
-                  downloaded and merged into this repo's config first —
-                  handy for sharing team configurations
+                  Open the session onto the Settings tab: toggle the checks
+                  column and the PR detail line, set the auto-refresh interval,
+                  and bind keys to GitHub Actions workflows. Tab switches to the
+                  Stack tab from there. With a URL (or local path) to a shared
+                  JSON file, its action bindings are downloaded and merged into
+                  this repo's config first — handy for sharing team configs
   --dir <path>    Run against the git repository at <path> instead of the
                   current directory
   --no-push       Rebase locally only; skip force-pushing
   -h, --help      Show this help message
 
-KEYS:
-  ↑/↓ or k/j      Move selection
-  r               Rebase the selected PR's chain: the root is fast-forwarded
-                  from origin, then every branch between the root and the
-                  selection is rebased bottom-up and force-pushed (with lease).
-                  With the root branch selected, this just pulls it from origin
-  c               Check out the selected branch
-  v               View the selected PR on GitHub
-  <bound key>     Run the bound GitHub Actions workflow (a-z or 0-9, set up
-                  via --configure) on the selected branch; press again to
-                  open the dispatched run
-  q               Quit
-
-Settings are saved per-repo in ~/.git-convoy.json.`;
+Keys are shown in-app: the footer lists the actions for the current selection,
+and the header shows the Stack / Settings tabs. Settings are saved per-repo in
+~/.git-convoy.json.`;
 
 function parseArgs(args: string[]): void {
   let i = 0;
@@ -681,6 +952,12 @@ function parseArgs(args: string[]): void {
       i += 1;
     } else if (arg === "--yours") {
       MODE = "yours";
+      i += 1;
+    } else if (arg === "--all") {
+      MODE = "all";
+      i += 1;
+    } else if (arg === "--org") {
+      MODE = "org";
       i += 1;
     } else if (arg === "--configure") {
       MODE = "configure";
@@ -710,12 +987,139 @@ const SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 let SPIN_I = 0;
 let SEL_LINE = 0;
 let SEL = 1;
+// Check-list selection: branches whose checks are expanded, and which check
+// of the selected row the cursor sits on (-1 = the row itself).
+const EXPANDED = new Set<string>();
+let CHECK_SEL = -1;
+let REFRESH_LEFT = 0;
+let REFRESH_TIMER: number | undefined;
+let REFRESHING = false;
 let BUSY = false;
+// True while the initial PR load is still in flight — the stack renders as
+// rows arrive, so this only drives the header's loading indicator and the
+// empty-stack skeleton.
+let LOADING = false;
+// Set once cached rows are showing but the live reload hasn't finished, so the
+// header can flag the view as stale.
+let STALE = false;
 let SEL_CHAIN = new Set<number>();
 let MESSAGE = "";
 let INFO = "";
 let STEP_LOG_TAIL = "";
 let LINES: string[] = [];
+// Lines pinned to the top of the window (the tab bar and repo slug); LINES
+// scrolls in the space below them.
+let HEADER: string[] = [];
+// Lines pinned to the bottom of the window (key hints, countdown, messages);
+// LINES scrolls in the space above them.
+let FOOTER: string[] = [];
+
+// The interactive session is a two-tab UI (Tab / Shift-Tab switches). The
+// stack tab is the PR view; the settings tab is what --configure opens onto.
+// Each tab owns its own selection cursor and build/keys functions, but both
+// paint through the shared LINES/FOOTER machinery above.
+export type Tab = "stack" | "settings";
+let TAB: Tab = "stack";
+export const TABS: Tab[] = ["stack", "settings"];
+const TAB_LABEL: Record<Tab, string> = { stack: "Stack", settings: "Settings" };
+
+// nextTab: the tab `step` positions away from `cur`, wrapping around. +1 is
+// Tab, -1 is Shift-Tab.
+export function nextTab(cur: Tab, step: number): Tab {
+  const i = TABS.indexOf(cur);
+  return TABS[(i + step + TABS.length) % TABS.length];
+}
+
+// tabBar: the left side of the header line, with the active tab highlighted.
+function tabBar(): string {
+  const cells = TABS.map((t) =>
+    t === TAB ? bold(cyan(`● ${TAB_LABEL[t]}`)) : dim(`  ${TAB_LABEL[t]}`)
+  );
+  return `  ${cells.join(dim("  │  "))}${dim("   · tab/⇧tab switch")}`;
+}
+
+// headerStatus: the discreet indicator shown at the far right of the header.
+// Always ends with "q quit"; on the stack tab the load/refresh state or
+// auto-refresh countdown is prepended, separated by a middot.
+function headerStatus(): string {
+  let lead = "";
+  if (TAB === "stack") {
+    if (LOADING) lead = `${SPIN_FRAMES[SPIN_I % 10]} loading`;
+    else if (REFRESHING) lead = `${SPIN_FRAMES[SPIN_I % 10]} refreshing`;
+    else if (STALE) lead = "cached";
+    else if (AUTO_REFRESH > 0) lead = `↻ ${formatCountdown(REFRESH_LEFT)}`;
+  }
+  return dim(lead ? `${lead} · q quit` : "q quit");
+}
+
+// visibleWidth: printed column count of a string, ignoring ANSI SGR codes.
+// Good enough for the ASCII/box content we render (no wide CJK).
+// deno-lint-ignore no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+// deno-lint-ignore no-control-regex
+const ANSI_HEAD_RE = /^\x1b\[[0-9;]*m/;
+export function visibleWidth(s: string): number {
+  return s.replace(ANSI_RE, "").length;
+}
+
+// truncateVisible: cut a string to at most `width` printed columns, keeping
+// ANSI SGR codes intact (they cost no width) and appending an ellipsis when
+// something was dropped. Used to guarantee box content fits its border.
+export function truncateVisible(s: string, width: number): string {
+  if (visibleWidth(s) <= width) return s;
+  if (width <= 0) return "";
+  let out = "";
+  let w = 0;
+  let i = 0;
+  const budget = width - 1; // leave a column for the ellipsis
+  while (i < s.length && w < budget) {
+    const m = s.slice(i).match(ANSI_HEAD_RE);
+    if (m) {
+      out += m[0];
+      i += m[0].length;
+      continue;
+    }
+    out += s[i];
+    i += 1;
+    w += 1;
+  }
+  // Carry any trailing reset codes so color never leaks past the cut.
+  const rest = s.slice(i).match(ANSI_RE);
+  if (rest) out += rest.join("");
+  return out + "…";
+}
+
+// boxed: wrap content lines in a rounded border with a title in the top edge:
+//   ╭─ title ────────────╮
+//   │ content            │
+//   ╰────────────────────╯
+// Each returned line is prefixed with `indent` spaces. `inner` is the content
+// width between the one-space border padding; content lines are padded
+// (accounting for ANSI codes) so the right border stays aligned. Every border
+// glyph is dimmed. The span between the corners is `inner + 2` in every row.
+export function boxed(
+  title: string,
+  content: string[],
+  inner: number,
+  indent = "  ",
+): string[] {
+  const b = (s: string) => dim(s);
+  // Top edge: "─ title " then dashes filling the rest of the span. The span
+  // (columns between the corners) grows to fit the title so every row lines up.
+  const label = title ? `─ ${title} ` : "";
+  const span = Math.max(inner + 2, visibleWidth(label) + 1);
+  const bodyInner = span - 2; // content width once the title is accounted for
+  const topFill = Math.max(span - visibleWidth(label), 0);
+  const out: string[] = [];
+  out.push(`${indent}${b("╭")}${b(label)}${b("─".repeat(topFill))}${b("╮")}`);
+  for (const raw of content) {
+    const line = truncateVisible(raw, bodyInner);
+    const pad = Math.max(bodyInner - visibleWidth(line), 0);
+    out.push(`${indent}${b("│")} ${line}${" ".repeat(pad)} ${b("│")}`);
+  }
+  out.push(`${indent}${b("╰")}${b("─".repeat(span))}${b("╯")}`);
+  return out;
+}
 
 const INTERACTIVE = Deno.stdin.isTerminal() && Deno.stdout.isTerminal();
 let RAW = false;
@@ -747,6 +1151,7 @@ function setRaw(on: boolean): void {
 }
 
 async function cleanup(): Promise<void> {
+  if (REFRESH_TIMER !== undefined) clearInterval(REFRESH_TIMER);
   if (INTERACTIVE) {
     exitAltScreen();
     write("\x1b[?25h");
@@ -761,9 +1166,9 @@ async function cleanup(): Promise<void> {
   await restoreBranch();
 }
 
-// paint: redraw LINES on the alternate screen from the top-left (shared by
-// the main and configure views). When LINES is taller than the window, a
-// scroll window keeps SEL_LINE visible.
+// paint: redraw the screen (shared by the main and configure views). HEADER is
+// pinned to the top rows and FOOTER to the bottom; LINES scrolls in the space
+// between them, keeping SEL_LINE visible.
 // viewTop: first visible line index — 0 while everything fits, otherwise
 // centered on the selection and clamped to the ends of the content.
 export function viewTop(total: number, rows: number, selLine: number): number {
@@ -773,8 +1178,20 @@ export function viewTop(total: number, rows: number, selLine: number): number {
 
 function paint(): void {
   const rows = termRows();
-  const top = viewTop(LINES.length, rows, SEL_LINE);
-  const view = LINES.slice(top, top + rows);
+  // Header and footer eat into the window from the top and bottom; on tiny
+  // windows the footer's trailing padding goes first and at least one content
+  // row always stays visible. The header is pinned as-is (it's short).
+  const padded = FOOTER.length > 0 ? [...FOOTER, ""] : FOOTER;
+  const header = HEADER.slice(0, Math.max(rows - 1, 0));
+  const footRoom = Math.max(rows - header.length - 1, 0);
+  const footer = padded.slice(0, footRoom);
+  const contentRows = Math.max(rows - header.length - footer.length, 1);
+  const top = viewTop(LINES.length, contentRows, SEL_LINE);
+  const view = [...header, ...LINES.slice(top, top + contentRows)];
+  if (footer.length > 0) {
+    while (view.length < header.length + contentRows) view.push("");
+    view.push(...footer);
+  }
   let out = "\x1b[H";
   for (let i = 0; i < view.length; i++) {
     out += `\x1b[2K${view[i]}`;
@@ -899,16 +1316,48 @@ async function importActions(src: string): Promise<void> {
   }
 }
 
-async function runConfigure(): Promise<void> {
-  if (!INTERACTIVE) {
-    die("--configure requires an interactive terminal (or a URL to import)");
-  }
+interface Workflow {
+  id: string;
+  name: string;
+}
 
-  interface Workflow {
-    id: string;
-    name: string;
+// Settings-tab state. Workflows load lazily the first time the tab is opened
+// (SETTINGS_LOADED guards the fetch); CSEL is the settings cursor, mirroring
+// the stack tab's SEL. The first three rows are the toggles; rows 3.. map to
+// WORKFLOWS[CSEL - 3].
+const WORKFLOWS: Workflow[] = [];
+let SETTINGS_LOADED = false;
+let CSEL = 0;
+let CMSG = "";
+
+function keyOfWf(wfId: string): string {
+  for (const [k, b] of ACTIONS) {
+    if (b.workflow === wfId) return k;
   }
-  const workflows: Workflow[] = [];
+  return "";
+}
+
+// Sample PR rendered through the same formatters as the stack view, so
+// toggling a setting shows exactly what it changes.
+const SETTINGS_PREVIEW = {
+  branch: "feat/set-phone-number",
+  checks: "47/48",
+  checksColor: "yellow",
+  num: "14397",
+  title: "feat(set-phone-number): generic set/verify mobile phone flow",
+  adds: 881,
+  dels: 0,
+  ahead: "2",
+};
+
+// The settings cursor can land on the three toggles plus one row per workflow.
+function settingsLast(): number {
+  return WORKFLOWS.length + 2;
+}
+
+async function loadSettings(): Promise<void> {
+  if (SETTINGS_LOADED) return;
+  SETTINGS_LOADED = true;
   const raw = await tryOut("gh", [
     "workflow",
     "list",
@@ -921,149 +1370,180 @@ async function runConfigure(): Promise<void> {
         if (wf.state !== "ACTIVE" && wf.state !== "active") continue;
         const id = String(wf.path ?? "").split("/").pop() ?? "";
         if (!id) continue;
-        workflows.push({ id, name: wf.name || wf.path });
+        WORKFLOWS.push({ id, name: wf.name || wf.path });
       }
     } catch {
       // no workflows
     }
   }
+}
 
-  let CSEL = 0;
-  let CMSG = "";
-  const last = workflows.length;
+function buildSettingsLines(): void {
+  buildHeader();
+  LINES = [];
 
-  const keyOfWf = (wfId: string): string => {
-    for (const [k, b] of ACTIONS) {
-      if (b.workflow === wfId) return k;
-    }
-    return "";
-  };
+  // The preview PR renders through the same formatters as the stack view,
+  // inside a bordered box so it reads as a self-contained sample. boxed()
+  // truncates any line that would overrun the border, so the inner width can
+  // just be sized to the window (capped so it stays readable on wide screens).
+  const previewInner = Math.max(Math.min(termCols() - 6, 84), 24);
+  const preview: string[] = [
+    `${cyan("●")} ${
+      formatBranchLine(SETTINGS_PREVIEW, {
+        showChecks: SHOW_CHECKS,
+        showPr: SHOW_PR,
+        current: false,
+        expand: "closed",
+      })
+    }`,
+  ];
+  if (SHOW_PR) {
+    preview.push(`  ${formatMetaLine(SETTINGS_PREVIEW, termCols(), 1)}`);
+  }
+  LINES.push(...boxed("preview", preview, previewInner));
+  LINES.push("");
 
-  const cbuild = () => {
-    LINES = [];
-    LINES.push("");
-    LINES.push(
-      `  ${bold("convoy settings")}${dim(` · ${REPO_SLUG || "local"}`)}`,
-    );
-    LINES.push("");
+  let cur = " ";
+  if (CSEL === 0) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
+  const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
+  LINES.push(
+    `  ${cur} Show checks ${state} ${
+      dim("· [passed/total] check status on each PR")
+    }`,
+  );
 
-    let cur = " ";
-    if (CSEL === 0) {
+  cur = " ";
+  if (CSEL === 1) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
+  const pr = SHOW_PR ? green("[on]") : dim("[off]");
+  LINES.push(
+    `  ${cur} Show pull request ${pr} ${
+      dim("· PR number/title line under each branch")
+    }`,
+  );
+
+  cur = " ";
+  if (CSEL === 2) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
+  const refresh = AUTO_REFRESH > 0
+    ? green(`[${formatCountdown(AUTO_REFRESH)}]`)
+    : dim("[off]");
+  LINES.push(
+    `  ${cur} Auto refresh ${refresh} ${dim("· re-fetch PRs periodically")}`,
+  );
+  LINES.push("");
+
+  LINES.push(`  ${dim("action keys")}`);
+  if (WORKFLOWS.length === 0) {
+    LINES.push(`      ${dim("no active workflows found in this repo")}`);
+  }
+  for (let i = 0; i < WORKFLOWS.length; i++) {
+    cur = " ";
+    if (CSEL === i + 3) {
       cur = bold(cyan("❯"));
       SEL_LINE = LINES.length;
     }
-    const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
+    const k = keyOfWf(WORKFLOWS[i].id);
+    const disp = k ? bold(cyan(k)) : dim("—");
     LINES.push(
-      `  ${cur} Show checks ${state} ${
-        dim("· [passed/total] check status on each PR")
-      }`,
+      `  ${cur} ${disp}  ${WORKFLOWS[i].name} ${dim(`· ${WORKFLOWS[i].id}`)}`,
     );
-    LINES.push("");
+  }
 
-    LINES.push(`  ${dim("action keys")}`);
-    if (workflows.length === 0) {
-      LINES.push(`      ${dim("no active workflows found in this repo")}`);
-    }
-    for (let i = 0; i < workflows.length; i++) {
-      cur = " ";
-      if (CSEL === i + 1) {
-        cur = bold(cyan("❯"));
-        SEL_LINE = LINES.length;
-      }
-      const k = keyOfWf(workflows[i].id);
-      const disp = k ? bold(cyan(k)) : dim("—");
-      LINES.push(
-        `  ${cur} ${disp}  ${workflows[i].name} ${dim(`· ${workflows[i].id}`)}`,
-      );
-    }
-
-    LINES.push("");
-    LINES.push(
-      `  ${
-        dim(
-          "↑↓ move · space toggle · a-z 0-9 bind · enter rename · esc unbind · q quit",
-        )
-      }`,
-    );
-    if (CMSG) {
-      LINES.push("");
-      LINES.push(`  ${yellow(CMSG)}`);
-    }
-  };
-
-  const crender = () => {
-    cbuild();
-    paint();
-  };
-
-  // Rename how a bound action is shown (in the footer and this list); the
-  // name is only stored in the local user's config. Reads one echoed line
-  // below the UI, which paint() then reclaims.
-  const renameSelected = async () => {
-    const wf = workflows[CSEL - 1];
-    const k = keyOfWf(wf.id);
-    if (!k) {
-      CMSG = "bind a key before renaming";
-      return;
-    }
-    const newName = await readLine(`  rename '${ACTIONS.get(k)!.name}' to: `);
-    if (newName) {
-      ACTIONS.get(k)!.name = newName;
-      wf.name = newName;
-      configSave();
-    }
-  };
-
-  enterAltScreen();
-  crender();
-
-  loop: while (true) {
-    const keys = await readKeys();
-    if (keys === null) break;
-    for (const key of keys) {
-      CMSG = "";
-      if (key === "\x1b[A" || key === "k") {
-        if (CSEL > 0) CSEL -= 1;
-        crender();
-      } else if (key === "\x1b[B" || key === "j") {
-        if (CSEL < last) CSEL += 1;
-        crender();
-      } else if (key === " " || key === "\r" || key === "\n") {
-        if (CSEL === 0) {
-          SHOW_CHECKS = !SHOW_CHECKS;
-          configSave();
-        } else if (key !== " ") {
-          await renameSelected();
-        }
-        crender();
-      } else if (key === "\x1b") {
-        if (CSEL > 0) {
-          const k = keyOfWf(workflows[CSEL - 1].id);
-          if (k) {
-            ACTIONS.delete(k);
-            configSave();
-          }
-        }
-        crender();
-      } else if (key === "q" || key === "\x03") {
-        break loop;
-      } else if (/^[a-z0-9]$/.test(key)) {
-        if (CSEL > 0) {
-          if (RESERVED_KEYS.includes(key)) {
-            CMSG = `'${key}' is reserved (${RESERVED_KEYS})`;
-          } else {
-            const wf = workflows[CSEL - 1];
-            const prev = keyOfWf(wf.id);
-            if (prev) ACTIONS.delete(prev);
-            // Assigning an already-used key steals it from the other workflow.
-            ACTIONS.set(key, { workflow: wf.id, name: wf.name });
-            configSave();
-          }
-        }
-        crender();
-      }
+  // The footer reflects what the selected settings row can do: the toggles
+  // flip with space, and only a workflow row shows the bind/rename/unbind
+  // hints (and rename/unbind only once a key is bound). Navigation, tab-switch,
+  // and quit are implicit (quit lives in the header).
+  FOOTER = [""];
+  const parts: string[] = [];
+  if (CSEL <= 2) {
+    parts.push("space toggle");
+  } else {
+    parts.push("a-z 0-9 bind");
+    if (keyOfWf(WORKFLOWS[CSEL - 3]?.id ?? "")) {
+      parts.push("enter rename");
+      parts.push("esc unbind");
     }
   }
+  FOOTER.push(`  ${parts.length ? dim(parts.join(" · ")) : ""}`);
+  if (CMSG) {
+    FOOTER.push("");
+    FOOTER.push(`  ${yellow(CMSG)}`);
+  }
+}
+
+// Rename how a bound action is shown (in the footer and the list); the name is
+// only stored in the local user's config. Reads one echoed line below the UI,
+// which paint() then reclaims.
+async function renameSelectedAction(): Promise<void> {
+  const wf = WORKFLOWS[CSEL - 3];
+  const k = keyOfWf(wf.id);
+  if (!k) {
+    CMSG = "bind a key before renaming";
+    return;
+  }
+  const newName = await readLine(`  rename '${ACTIONS.get(k)!.name}' to: `);
+  if (newName) {
+    ACTIONS.get(k)!.name = newName;
+    wf.name = newName;
+    configSave();
+  }
+}
+
+// handleSettingsKey: one key for the settings tab. Returns false only for keys
+// the shared loop owns (quit, tab-switch) so it can act on them.
+async function handleSettingsKey(key: string): Promise<boolean> {
+  CMSG = "";
+  if (key === "\x1b[A" || key === "k") {
+    if (CSEL > 0) CSEL -= 1;
+  } else if (key === "\x1b[B" || key === "j") {
+    if (CSEL < settingsLast()) CSEL += 1;
+  } else if (key === " " || key === "\r" || key === "\n") {
+    if (CSEL === 0) {
+      SHOW_CHECKS = !SHOW_CHECKS;
+      configSave();
+    } else if (CSEL === 1) {
+      SHOW_PR = !SHOW_PR;
+      configSave();
+    } else if (CSEL === 2) {
+      AUTO_REFRESH = nextAutoRefresh(AUTO_REFRESH);
+      configSave();
+    } else if (key !== " ") {
+      await renameSelectedAction();
+    }
+  } else if (key === "\x1b") {
+    if (CSEL > 2) {
+      const k = keyOfWf(WORKFLOWS[CSEL - 3].id);
+      if (k) {
+        ACTIONS.delete(k);
+        configSave();
+      }
+    }
+  } else if (/^[a-z0-9]$/.test(key)) {
+    if (CSEL > 2) {
+      if (RESERVED_KEYS.includes(key)) {
+        CMSG = `'${key}' is reserved (${RESERVED_KEYS})`;
+      } else {
+        const wf = WORKFLOWS[CSEL - 3];
+        const prev = keyOfWf(wf.id);
+        if (prev) ACTIONS.delete(prev);
+        // Assigning an already-used key steals it from the other workflow.
+        ACTIONS.set(key, { workflow: wf.id, name: wf.name });
+        configSave();
+      }
+    }
+  } else {
+    return false;
+  }
+  render();
+  return true;
 }
 
 // ── Main view ────────────────────────────────────────────────────────────────
@@ -1087,6 +1567,14 @@ function glyphFor(i: number): string {
       }
       return BUSY ? grey("○") : dim("○");
   }
+}
+
+function rowChecks(i: number): CheckItem[] {
+  return SHOW_CHECKS ? ROWS[i]?.checkItems ?? [] : [];
+}
+
+function isExpanded(i: number): boolean {
+  return EXPANDED.has(ROWS[i]?.branch ?? "") && rowChecks(i).length > 0;
 }
 
 // Mark the rows a rebase of SEL would touch: the stack's root plus every
@@ -1129,26 +1617,119 @@ function colorFn(name: string): (s: string) => string {
   }
 }
 
+// formatBranchLine / formatMetaLine: the two lines every PR row renders as.
+// Shared by the main view and the configure preview so they can't drift.
+// With showPr off there is no meta line, so the delta moves onto the branch
+// line instead.
+export function formatDelta(
+  pr: { adds: number; dels: number; ahead: string },
+): string {
+  return `${green(`+${pr.adds}`)} ${red(`−${pr.dels}`)}${
+    dim(` · ${pr.ahead} ahead`)
+  }`;
+}
+
+// The current branch is marked with a trailing asterisk; rows whose checks
+// can be drilled into get a ▸ (▾ once expanded) after the checks badge.
+export function formatBranchLine(
+  pr: {
+    branch: string;
+    checks: string;
+    checksColor: string;
+    adds: number;
+    dels: number;
+    ahead: string;
+  },
+  opts: {
+    showChecks: boolean;
+    showPr: boolean;
+    current: boolean;
+    expand?: "open" | "closed";
+  },
+): string {
+  const name = opts.current ? `${pr.branch}*` : pr.branch;
+  let bname = opts.current ? bold(cyan(name)) : cyan(name);
+  if (opts.showChecks && pr.checks) {
+    bname += ` ${colorFn(pr.checksColor)(`[${pr.checks}]`)}`;
+    if (opts.expand) bname += ` ${dim(opts.expand === "open" ? "▾" : "▸")}`;
+  }
+  if (!opts.showPr) bname += ` ${formatDelta(pr)}`;
+  return bname;
+}
+
+export function formatMetaLine(
+  pr: { num: string; title: string; adds: number; dels: number; ahead: string },
+  cols: number,
+  indent: number,
+): string {
+  let title = pr.title;
+  let max = cols - indent - 32;
+  if (max < 12) max = 12;
+  if (title.length > max) title = title.slice(0, max - 1) + "…";
+  return `${dim(`#${pr.num}`)} ${title}  ${formatDelta(pr)}`;
+}
+
+// buildHeader: the pinned top rows shared by both tabs — a blank spacer, the
+// tab bar, the repo slug, and a blank separator. Non-interactive output has no
+// tabs, so it keeps the old single-line "convoy · slug" title in LINES instead.
+function buildHeader(): void {
+  if (!INTERACTIVE) {
+    HEADER = [];
+    return;
+  }
+  // Tab bar on the left, discreet status on the right of the same line.
+  const left = tabBar();
+  const status = headerStatus();
+  let bar = left;
+  if (status) {
+    const gap = termCols() - 2 - visibleWidth(left) - visibleWidth(status);
+    bar = `${left}${" ".repeat(Math.max(gap, 1))}${status}`;
+  }
+  HEADER = [
+    "",
+    bar,
+    dim(`  ${REPO_SLUG || "local"}`),
+    "",
+  ];
+}
+
 function buildLines(): void {
+  buildHeader();
   LINES = [];
-  LINES.push("");
-  LINES.push(`  ${bold("convoy")}${dim(` · ${REPO_SLUG || "local"}`)}`);
-  LINES.push("");
+  if (!INTERACTIVE) {
+    LINES.push("");
+    LINES.push(`  ${bold("convoy")}${dim(` · ${REPO_SLUG || "local"}`)}`);
+    LINES.push("");
+  }
 
   markSelChain();
 
   const cols = termCols();
 
+  // Nothing to draw yet: show a short skeleton so the window isn't blank while
+  // the first PRs come back. The spinner in the header signals live progress.
+  if (INTERACTIVE && ROWS.length === 0 && LOADING) {
+    LINES.push("");
+    LINES.push(`  ${dim("○")} ${dim("loading pull requests…")}`);
+    LINES.push(`  ${dim("○")} ${grey("resolving stack")}`);
+  }
+
   for (let i = 0; i < ROWS.length; i++) {
     const row = ROWS[i];
     let cursor = " ";
-    if (INTERACTIVE && i === SEL) {
+    if (INTERACTIVE && i === SEL && CHECK_SEL < 0) {
       cursor = BUSY ? grey("❯") : bold(cyan("❯"));
       SEL_LINE = LINES.length;
     }
 
     if (!row.parent) {
       if (i > 0) LINES.push("");
+      // In an overview the root is a repo name (owner/name), not a git branch —
+      // no origin comparison applies, so just show the repo.
+      if (isOverview()) {
+        LINES.push(`  ${cursor} ${glyphFor(i)} ${bold(row.branch)}`);
+        continue;
+      }
       let behind;
       if (row.behind === "?") {
         behind = dim("· origin unknown");
@@ -1166,54 +1747,114 @@ function buildLines(): void {
     const ind = " ".repeat(row.depth);
     const g = glyphFor(i);
 
-    let bname = cyan(row.branch);
-    if (row.branch === CUR_BRANCH) bname = bold(cyan(row.branch));
-    if (SHOW_CHECKS && row.checks) {
-      bname += ` ${colorFn(row.checksColor)(`[${row.checks}]`)}`;
-    }
-    if (row.branch === CUR_BRANCH) bname += grey(" ← you are here");
+    const bname = formatBranchLine(
+      { ...row, branch: row.display ?? row.branch },
+      {
+        showChecks: SHOW_CHECKS,
+        // showPr:false appends the diff delta to the branch line; overviews
+        // have no delta data, so keep it true there to suppress it.
+        showPr: isOverview() ? true : SHOW_PR,
+        current: row.branch === CUR_BRANCH,
+        expand: row.checkItems.length > 0
+          ? (isExpanded(i) ? "open" : "closed")
+          : undefined,
+      },
+    );
     let note = "";
     if (row.draft) note = ` ${yellow("[draft]")}`;
     if (row.note) note += grey(` · ${row.note}`);
     LINES.push(`  ${ind}${cursor} ${g} ${bname}${note}`);
 
-    let title = row.title;
-    let max = cols - ind.length - 32;
-    if (max < 12) max = 12;
-    if (title.length > max) title = title.slice(0, max - 1) + "…";
-    const meta = `${dim(`#${row.num}`)} ${title}  ${green(`+${row.adds}`)} ${
-      red(`−${row.dels}`)
-    }${dim(` · ${row.ahead} ahead`)}`;
-    LINES.push(`  ${ind}    ${meta}`);
+    // Overview rows have only a number to show below the title; same-repo rows
+    // get the full #num/title/delta meta line.
+    if (isOverview()) {
+      LINES.push(`  ${ind}    ${dim(`#${row.num}`)}`);
+    } else if (SHOW_PR) {
+      LINES.push(`  ${ind}    ${formatMetaLine(row, cols, ind.length)}`);
+    }
+
+    if (isExpanded(i)) {
+      for (let ci = 0; ci < row.checkItems.length; ci++) {
+        const chk = row.checkItems[ci];
+        let ccur = " ";
+        if (INTERACTIVE && i === SEL && ci === CHECK_SEL) {
+          ccur = BUSY ? grey("❯") : bold(cyan("❯"));
+          SEL_LINE = LINES.length;
+        }
+        const cg = chk.state === "pass"
+          ? green("✓")
+          : chk.state === "fail"
+          ? red("✗")
+          : yellow("●");
+        LINES.push(`  ${ind}    ${ccur} ${cg} ${chk.name}`);
+      }
+    }
   }
 
-  LINES.push("");
+  FOOTER = [];
   if (INTERACTIVE) {
-    LINES.push(
-      `  ${dim("↑↓ move · r rebase · c checkout · v view on github · q quit")}`,
-    );
-    const hints = actionHints();
-    if (hints) LINES.push(`  ${dim(hints)}`);
+    const selRow = ROWS[SEL];
+    const onCheck = CHECK_SEL >= 0;
+    const hasChecks = SHOW_CHECKS && rowChecks(SEL).length > 0;
+    const expanded = isExpanded(SEL);
+    const isRoot = selRow && !selRow.parent;
+
+    // Only the distinctive actions for the current selection — enter/space is
+    // the universal "open" (view PR, open check), so it isn't spelled out, and
+    // navigation, tab-switch, and quit are implicit (quit lives in the header).
+    const parts: string[] = [];
+
+    if (ROWS.length === 0) {
+      // nothing selectable
+    } else if (onCheck) {
+      // enter opens the check (universal action); ← returns to the PR row.
+      parts.push("← collapse");
+    } else {
+      if (hasChecks) {
+        parts.push(expanded ? "→ checks · ← collapse" : "→ checks");
+      }
+      // enter opens the selected PR/check — a universal action, not spelled out.
+      // Overviews are cross-repo read-only: rebase/checkout don't apply.
+      if (!isOverview()) {
+        parts.push("r rebase");
+        parts.push("c checkout");
+      }
+    }
+    // The auto-refresh countdown/spinner lives in the header now; the footer
+    // keeps just the manual-refresh key hint.
+    if (ROWS.length > 0 && AUTO_REFRESH > 0) parts.push("R refresh");
+
+    FOOTER.push("");
+    FOOTER.push(`  ${parts.length ? dim(parts.join(" · ")) : ""}`);
+
+    if (!onCheck && !isRoot) {
+      const hints = actionHints();
+      if (hints) FOOTER.push(`  ${dim(hints)}`);
+    }
   }
   if (INFO) {
-    LINES.push("");
-    LINES.push(`  ${dim(INFO)}`);
+    FOOTER.push("");
+    FOOTER.push(`  ${dim(INFO)}`);
   }
   if (MESSAGE) {
-    LINES.push("");
+    FOOTER.push("");
     for (const line of MESSAGE.split("\n")) {
-      LINES.push(`  ${red(line)}`);
+      FOOTER.push(`  ${red(line)}`);
     }
   }
   if (STEP_LOG_TAIL) {
     for (const line of STEP_LOG_TAIL.split("\n")) {
-      LINES.push(`    ${grey(line)}`);
+      FOOTER.push(`    ${grey(line)}`);
     }
   }
 }
 
 function render(): void {
-  buildLines();
+  if (TAB === "settings") {
+    buildSettingsLines();
+  } else {
+    buildLines();
+  }
   paint();
 }
 
@@ -1283,10 +1924,69 @@ async function checkoutSelected(): Promise<void> {
   render();
 }
 
+// openUrl: hand a URL to the platform browser opener (used for check links and
+// cross-repo PRs, which can't go through `gh pr view` against this repo).
+async function openUrl(url: string): Promise<void> {
+  if (!url) return;
+  const opener = Deno.build.os === "darwin"
+    ? "open"
+    : Deno.build.os === "windows"
+    ? "explorer"
+    : "xdg-open";
+  await tryOut(opener, [url]);
+}
+
 async function openSelectedPr(): Promise<void> {
-  const num = ROWS[SEL].num;
-  if (!num) return;
-  await tryOut("gh", ["pr", "view", num, "--web"]);
+  const row = ROWS[SEL];
+  if (!row?.num) return;
+  // --all rows live in other repos — open the stored URL directly.
+  if (row.url) {
+    await openUrl(row.url);
+    return;
+  }
+  await tryOut("gh", ["pr", "view", row.num, "--web"]);
+}
+
+// Check detail links can point anywhere (GitHub, external CI), so use the
+// platform opener rather than gh.
+async function openSelectedCheck(): Promise<void> {
+  await openUrl(rowChecks(SEL)[CHECK_SEL]?.url ?? "");
+}
+
+// refreshData: re-fetch PRs and git stats in place. On failure the previous
+// data is restored, so a flaky network never blanks the view.
+async function refreshData(): Promise<void> {
+  if (BUSY) return;
+  BUSY = true;
+  REFRESHING = true;
+  render();
+
+  const selBranch = ROWS[SEL]?.branch ?? "";
+  // The loaders build into scratch and swap in one burst, so the current rows
+  // stay visible during the refetch; keep a snapshot only to restore on error.
+  const snapshot = ROWS.map((r) => ({ ...r }));
+
+  try {
+    await loadStack();
+    await loadGitStats();
+    for (const b of [...EXPANDED]) {
+      if (!ROW_OF.has(b)) EXPANDED.delete(b);
+    }
+    STALE = false;
+    INFO = "";
+    saveStackCache();
+  } catch {
+    restoreRows(snapshot);
+    INFO = "refresh failed — showing previous data";
+  }
+
+  SEL = ROW_OF.get(selBranch) ?? ROW_OF.get(CUR_BRANCH) ?? 1;
+  CHECK_SEL = isExpanded(SEL)
+    ? Math.min(CHECK_SEL, rowChecks(SEL).length - 1)
+    : -1;
+  REFRESHING = false;
+  BUSY = false;
+  render();
 }
 
 // First press dispatches the bound workflow on the selected row's branch;
@@ -1363,26 +2063,97 @@ async function runActionKey(key: string): Promise<void> {
   render();
 }
 
+// switchTab: move to another tab, lazily loading the settings tab's workflow
+// list the first time it's opened (with a spinner, since it shells out to gh).
+async function switchTab(to: Tab): Promise<void> {
+  if (TAB === to) return;
+  TAB = to;
+  if (to === "settings" && !SETTINGS_LOADED) {
+    CMSG = "";
+    buildHeader();
+    LINES = ["", dim("  loading workflows…")];
+    FOOTER = [];
+    paint();
+    await loadSettings();
+    CSEL = Math.min(CSEL, settingsLast());
+  }
+  render();
+}
+
 async function inputLoop(): Promise<void> {
-  const last = ROWS.length - 1;
   loop: while (true) {
     const keys = await readKeys();
     if (keys === null) break;
     for (const key of keys) {
+      if (key === "q" || key === "\x03") break loop;
+      // A timer-driven refresh may be running while we sit in readKeys; drop
+      // action keys instead of interleaving with it.
+      if (BUSY) continue;
+      // Tab / Shift-Tab cycle tabs from either view.
+      if (key === "\t") {
+        await switchTab(nextTab(TAB, 1));
+        continue;
+      }
+      if (key === "\x1b[Z") {
+        await switchTab(nextTab(TAB, -1));
+        continue;
+      }
+      if (TAB === "settings") {
+        await handleSettingsKey(key);
+        continue;
+      }
+      // The stack can be empty if it failed to load (e.g. --configure on a
+      // detached HEAD); only tab-switch and quit apply until there are rows.
+      if (ROWS.length === 0) continue;
+      const last = ROWS.length - 1;
       if (key === "\x1b[A" || key === "k") {
-        if (SEL > 0) SEL -= 1;
+        if (CHECK_SEL >= 0) {
+          CHECK_SEL -= 1;
+        } else if (SEL > 0) {
+          SEL -= 1;
+          CHECK_SEL = isExpanded(SEL) ? rowChecks(SEL).length - 1 : -1;
+        }
         render();
       } else if (key === "\x1b[B" || key === "j") {
-        if (SEL < last) SEL += 1;
+        if (isExpanded(SEL) && CHECK_SEL < rowChecks(SEL).length - 1) {
+          CHECK_SEL += 1;
+        } else if (SEL < last) {
+          SEL += 1;
+          CHECK_SEL = -1;
+        }
         render();
+      } else if (key === "\r" || key === "\n" || key === " ") {
+        // enter/space is the universal "open": a check on a check row, else
+        // the PR on GitHub.
+        if (CHECK_SEL >= 0) {
+          await openSelectedCheck();
+        } else {
+          await openSelectedPr();
+        }
+      } else if (key === "\x1b[C") {
+        // On a PR row: expand/collapse its checks. On a check: open it.
+        if (CHECK_SEL >= 0) {
+          await openSelectedCheck();
+        } else if (rowChecks(SEL).length > 0) {
+          const b = ROWS[SEL].branch;
+          if (!EXPANDED.delete(b)) EXPANDED.add(b);
+          render();
+        }
+      } else if (key === "\x1b[D") {
+        if (isExpanded(SEL)) {
+          EXPANDED.delete(ROWS[SEL].branch);
+          CHECK_SEL = -1;
+          render();
+        }
       } else if (key === "r") {
-        await startRebase();
+        if (!isOverview()) await startRebase();
       } else if (key === "c") {
-        await checkoutSelected();
+        if (!isOverview()) await checkoutSelected();
       } else if (key === "v") {
         await openSelectedPr();
-      } else if (key === "q" || key === "\x03") {
-        break loop;
+      } else if (key === "R" && AUTO_REFRESH > 0) {
+        REFRESH_LEFT = AUTO_REFRESH;
+        await refreshData();
       } else if (key.length === 1 && ACTIONS.has(key)) {
         await runActionKey(key);
       }
@@ -1408,38 +2179,130 @@ async function main(): Promise<void> {
   REPO_SLUG = await repoSlug();
   configLoad();
 
-  if (MODE === "configure") {
-    if (CONFIG_IMPORT) await importActions(CONFIG_IMPORT);
-    if (INTERACTIVE || !CONFIG_IMPORT) {
-      setRaw(true);
-      await runConfigure();
+  // --configure opens the session onto the Settings tab; Tab switches back to
+  // the stack. A shared JSON import still runs first and, without a terminal,
+  // is the whole job (no TUI to show).
+  const startOnSettings = MODE === "configure";
+  if (CONFIG_IMPORT) await importActions(CONFIG_IMPORT);
+  if (startOnSettings && !INTERACTIVE) {
+    if (!CONFIG_IMPORT) {
+      die("--configure requires an interactive terminal (or a URL to import)");
     }
     return;
   }
 
-  if (INTERACTIVE) write(dim("loading pull requests…"));
-  if (MODE === "yours") {
-    await loadStackYours();
-  } else {
-    await loadStackCurrent();
-  }
-  if (INTERACTIVE) write("\r\x1b[2K");
-  if (INTERACTIVE) write(dim("fetching origin…"));
-  for (const root of ROOTS) {
-    await tryOut("git", ["fetch", "origin", root, "--quiet"]);
-  }
-  if (INTERACTIVE) write("\r\x1b[2K");
-  await loadGitStats();
-  SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
-
+  // ── Non-interactive: block, load everything, print once. ──────────────────
   if (!INTERACTIVE) {
+    try {
+      await loadStack();
+      // Overviews are cross-repo: no local branches to fetch or diff against.
+      if (!isOverview()) {
+        for (const root of ROOTS) {
+          await tryOut("git", ["fetch", "origin", root, "--quiet"]);
+        }
+        await loadGitStats();
+      }
+    } catch (e) {
+      if (!startOnSettings) throw e;
+      INFO = e instanceof Error ? e.message : String(e);
+    }
+    SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
     buildLines();
-    console.log(LINES.join("\n"));
+    console.log([...HEADER, ...LINES, ...FOOTER].join("\n"));
     return;
   }
 
+  // ── Interactive: paint the shell instantly, then fill it in place. ────────
   enterAltScreen();
   setRaw(true);
+
+  // 1. If a cached stack exists, show it immediately (marked stale) so the
+  //    window is populated before any network call returns.
+  const cached = loadStackCache();
+  if (cached && !startOnSettings) {
+    restoreRows(cached.rows);
+    CUR_BRANCH = cached.curBranch;
+    SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
+    STALE = true;
+  }
+  if (startOnSettings) {
+    TAB = "settings";
+    await loadSettings();
+  }
+  render();
+
+  // 2. Load PRs, animating the header spinner. The loaders build into scratch
+  //    and swap the stack in one burst, so cached rows (if any) stay on screen
+  //    the whole time and are replaced only once fresh data is ready. On
+  //    failure the cache remains untouched.
+  LOADING = true;
+  const spin = setInterval(() => {
+    SPIN_I += 1;
+    render();
+  }, 80);
+  const selBranch = ROWS[SEL]?.branch ?? "";
+  const hadCache = ROWS.length > 0;
+  let loadErr = "";
+  try {
+    await loadStack(() => render());
+    STALE = false;
+    INFO = "";
+  } catch (e) {
+    loadErr = e instanceof Error ? e.message : String(e);
+    if (hadCache) INFO = "showing cached data — reload failed";
+  }
+  clearInterval(spin);
+  LOADING = false;
+  render();
+
+  if (ROWS.length === 0 && loadErr) {
+    // Nothing to show and no cache to fall back on.
+    if (!startOnSettings) throw new Error(loadErr);
+    INFO = loadErr;
+  }
+  SEL = ROW_OF.get(selBranch) ?? ROW_OF.get(CUR_BRANCH) ?? 1;
+
+  // Overviews are cross-repo: skip the git stats and origin fetch (they only
+  // make sense for branches in the current repo) but still cache the rows.
+  const localStack = !isOverview();
+
+  // 3. Local git stats are cheap (no network) — compute and paint them now.
+  if (ROWS.length > 0 && localStack) {
+    await loadGitStats();
+    saveStackCache();
+    render();
+  } else if (ROWS.length > 0) {
+    saveStackCache();
+  }
+
+  // 4. Fetch origin in the background and refresh behind/ahead counts in
+  //    place; the UI is already fully usable while this runs.
+  if (ROWS.length > 0 && ROOTS.length > 0 && localStack) {
+    (async () => {
+      for (const root of ROOTS) {
+        await tryOut("git", ["fetch", "origin", root, "--quiet"]);
+      }
+      if (!BUSY) {
+        await loadGitStats();
+        saveStackCache();
+        render();
+      }
+    })();
+  }
+
+  if (AUTO_REFRESH > 0) {
+    REFRESH_LEFT = AUTO_REFRESH;
+    REFRESH_TIMER = setInterval(() => {
+      if (BUSY) return; // pause the countdown while an operation runs
+      REFRESH_LEFT -= 1;
+      if (REFRESH_LEFT <= 0) {
+        REFRESH_LEFT = AUTO_REFRESH;
+        refreshData();
+      } else {
+        render();
+      }
+    }, 1000);
+  }
   render();
   await inputLoop();
 }
@@ -1469,6 +2332,6 @@ if (import.meta.main) {
   } finally {
     await cleanup();
   }
-  if (fatal) console.error(fatal);
+  if (fatal) console.error(red(fatal));
   Deno.exit(exitCode);
 }

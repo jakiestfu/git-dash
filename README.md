@@ -84,8 +84,10 @@ straight from [JSR](https://jsr.io) or npm via `deno add`, recorded in
 
 ```bash
 git cv                       # current branch's PR and its ancestors (--current)
-git cv --yours               # all of your open PRs, grouped into stacks
-git cv --configure           # settings UI: checks column, action key bindings
+git cv --yours               # all of your open PRs in this repo, grouped into stacks
+git cv --all                 # all of your open PRs across every repo, grouped by repo
+git cv --org                 # like --all, limited to the current repo's organization
+git cv --configure           # settings UI: checks column, auto-refresh, action keys
 git cv --no-push             # rebase locally only; skip force-pushing
 git cv --dir ./some-repo     # run against another directory's repository
 ```
@@ -100,6 +102,14 @@ first base with no open PR, e.g. `main`) — it never lists the whole repo's PRs
 that isn't one of your PRs (like `main`, or a teammate's branch you stacked on)
 renders as that stack's root.
 
+`--all` widens that to every repo: it lists all your open PRs via `gh search
+prs` and groups them under a root per repository. `--org` is the same but
+scoped to the current repo's organization (the owner in `owner/repo`). Because
+the cross-repo search exposes far less than `gh pr view` (no base branch, diff
+size, or checks) and the PRs live outside your working directory, these are
+read-only overviews — rebase, checkout, and the checks column are off; `enter`
+opens the selected PR on GitHub.
+
 The root renders at the top; each PR sits one level below its parent, indented
 one space per level. Filled radios (`●`) mark the branches the current selection
 would rebase — the root plus every branch between it and the selected row (whose
@@ -107,33 +117,56 @@ radio is bold) — while empty radios (`○`) are left untouched. During a rebas
 all radios grey out until the cascade finishes.
 
 ```
-  convoy · turo/web-schumacher-app
+  ● Stack  │    Settings   · tab/⇧tab switch                              ↻ 27s · q quit
+  turo/web-schumacher-app
 
     ● main · 2 behind origin
-     ● feat/set-phone-number [5/5]
+     ● feat/set-phone-number [5/5] ▸
        #14397 Set phone number  +881 −0 · 2 ahead
-      ● feat/managed-vehicles-onboarding [3/5]
+      ● feat/managed-vehicles-onboarding [3/5] ▸
         #14331 Owner onboarding  +1464 −115 · 5 ahead
-     ❯ ● feat/managed-vehicles-groups [2/3] ← you are here
+     ❯ ● feat/managed-vehicles-groups* [2/3] ▸
          #14402 Managed groups dashboard  +1130 −53 · 3 ahead
 
-  ↑↓ move · r rebase · c checkout · v view on github · q quit
+  → checks · r rebase · c checkout
   i translations - integrate · p translations - push
 ```
 
-Bound action keys (here `i` and `p`) get their own footer line.
+Bound action keys (here `i` and `p`) get their own footer line. The branch
+you're currently on is marked with a trailing `*`; a `▸` after the checks badge
+means the row's checks can be drilled into with `→` (it flips to `▾` while
+expanded).
+
+### Instant startup
+
+The window paints as soon as it opens. The last-loaded stack is cached per repo
+(in `~/.git-convoy-cache.json`), so a relaunch shows the previous PRs
+immediately while the live data reloads in place — a small spinner in the
+top-right of the header marks the refresh. On a cold start (no cache) the local
+git stats fill in first and the `origin` fetch runs in the background, so ahead/
+behind counts sharpen a moment after the PRs appear rather than blocking the
+first paint.
 
 ## Keys
 
+- `Tab` / `Shift-Tab` — switch between the **Stack** and **Settings** tabs
+  (the tab bar sits at the top of both)
 - `↑`/`↓` or `k`/`j` — move the selection
+- `enter` / `space` — open the current selection: the PR on GitHub, or (with a
+  check selected) that check in the browser. `v` also views the selected PR
 - `r` — rebase the selected PR's chain (see below); with the root branch
   selected, this just pulls it from origin
 - `c` — check out the selected branch
-- `v` — view the selected PR on GitHub
+- `→` — expand the selected PR's checks into a list below it; `↑`/`↓` move onto
+  a check and `enter`/`→` opens it in the browser; `←` collapses
+- `R` — refresh the view now (shown when auto-refresh is enabled)
 - any bound action key (see `--configure`) — dispatch that GitHub Actions
   workflow on the selected branch; once the run is up the hint flips to
   `<key> view` and pressing it again opens the run in the browser
-- `q` — quit
+- `q` — quit (shown in the top-right of the header)
+
+The footer lists only the actions distinctive to the current selection; `enter`
+to open, arrow-key navigation, tab-switching, and `q` are implicit.
 
 The root branch (e.g. `main`) is selectable like any other row.
 
@@ -145,11 +178,26 @@ everything passed. The counts come from the same `gh` calls that load the PRs,
 so they cost nothing extra. Toggle the column off in `--configure` ("Show
 checks", on by default).
 
+Press `→` on a PR row to expand its individual checks below it — each with its
+own ✓/✗/pending glyph, failed checks sorted to the top — then move onto one and
+press `→` again to open it in the browser (check links can point at GitHub or an
+external CI). `←` collapses the list.
+
 ## Configure
 
-`git cv --configure` opens the settings UI:
+Settings live on their own tab. Press `Tab` from the stack to reach it, or
+launch straight onto it with `git cv --configure`; either way `Tab` /
+`Shift-Tab` moves between the two (the tab bar stays pinned at the top of the
+window). A preview PR in a bordered box re-renders as you change settings, so
+you can see exactly what each toggle does:
 
 - **Show checks** — toggle the `[passed/total]` column with `space`/`enter`.
+- **Show pull request** — toggle the `#14397 title  +881 −0 · 2 ahead` line
+  under each branch. When hidden, the `+881 −0 · 2 ahead` delta moves onto the
+  branch line itself.
+- **Auto refresh** — cycle `off → 30s → 1m → 5m` with `space`/`enter`. When
+  enabled, the stack tab re-fetches PRs on that interval, shows a countdown in
+  the top-right of the header, and `R` refreshes on demand.
 - **Action keys** — every active GitHub Actions workflow in the repo is listed.
   Select one and press a letter or digit (`a-z`, `0-9`) to bind it (`t` on
   "Upload Translations" makes `t` dispatch that workflow from the main view);
@@ -161,8 +209,8 @@ checks", on by default).
 ### Sharing team configurations
 
 `git cv --configure <url>` downloads a JSON file (a URL or a local path) and
-merges its action bindings into this repo's config before opening the UI — in a
-non-interactive shell it just merges and prints a summary. Imported bindings win
+merges its action bindings into this repo's config before opening the Settings
+tab — in a non-interactive shell it just merges and prints a summary. Imported bindings win
 over your local ones; reserved keys are skipped. The file can be a full config
 (bindings are read from `repos["owner/repo"].actions`) or a repo-agnostic
 fragment:
@@ -190,6 +238,8 @@ Settings are saved per-repo in `~/.git-convoy.json`:
   "repos": {
     "owner/repo": {
       "showChecks": true,
+      "showPr": true,
+      "autoRefresh": 30,
       "actions": {
         "t": {
           "workflow": "upload-translations.yml",
