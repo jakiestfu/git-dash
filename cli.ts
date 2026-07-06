@@ -30,12 +30,15 @@ The session has two tabs — Pull Requests and Settings — switched with Tab /
 Shift-Tab.
 
 OPTIONS:
-  --current       Show the current branch's PR and its ancestors (default)
-  --yours         Show all of your open PRs in this repo, grouped into stacks
-  --all           Show all of your open PRs across every repo, grouped by repo.
-                  A read-only overview (no rebase/checkout/checks — those need a
-                  local clone); press enter to open a PR on GitHub
-  --org           Like --all, but limited to the current repo's organization
+  --scope=<scope> Which PRs to show (default: current):
+                    current  the current branch's PR and its ancestors
+                    yours    all of your open PRs in this repo, grouped into
+                             stacks
+                    org      all of your open PRs across the current repo's
+                             organization, grouped by repo (read-only overview)
+                    all      all of your open PRs across every repo, grouped by
+                             repo (read-only overview); enter opens a PR on
+                             GitHub
   --configure [URL]
                   Open the session onto the Settings tab: toggle the checks
                   column and the PR detail line, set the auto-refresh interval,
@@ -58,14 +61,14 @@ and the header shows the Pull Requests / Settings tabs. Settings are saved
 per-repo in
 ~/.git-dash.json.`;
 
-// The mutually-exclusive view flags; the last one given wins (matching the old
-// loop). --configure also switches to the settings tab.
-const MODE_FLAGS: Mode[] = ["current", "yours", "all", "org", "configure"];
+// --scope selects which PRs to show; each value maps 1:1 to an internal Mode.
+// --configure is a separate mode (it opens the Settings tab).
+const SCOPES = ["current", "yours", "org", "all"] as const;
 
 export function parseArgs(args: string[]): CliOptions {
   const flags = parse(args, {
-    boolean: ["no-push", "help", "current", "yours", "all", "org"],
-    string: ["dir", "configure"],
+    boolean: ["no-push", "help"],
+    string: ["dir", "configure", "scope"],
     alias: { help: "h" },
     unknown: (arg: string) => {
       // Positionals are allowed (e.g. `--configure some.json`); reject only
@@ -89,12 +92,17 @@ export function parseArgs(args: string[]): CliOptions {
     return { push: true, baseDir: "", mode: "upgrade", configImport: "" };
   }
 
-  // configure is both a mode and (optionally) a string value; presence of the
-  // flag is what selects the mode.
+  // configure takes precedence and (optionally) carries a string value; its
+  // presence is what selects the mode.
   const configureGiven = flags.configure !== undefined;
   let mode: Mode = "current";
-  for (const m of MODE_FLAGS) {
-    if (m === "configure" ? configureGiven : flags[m]) mode = m;
+  if (configureGiven) {
+    mode = "configure";
+  } else if (flags.scope !== undefined) {
+    if (!SCOPES.includes(flags.scope as typeof SCOPES[number])) {
+      die(`--scope must be one of: ${SCOPES.join(", ")}`);
+    }
+    mode = flags.scope as Mode;
   }
 
   // The import path may arrive as `--configure=x`, `--configure x` (a non-empty

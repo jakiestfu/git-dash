@@ -5,8 +5,10 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import { setColorEnabled } from "jsr:@std/fmt@1/colors";
 import {
   boxed,
+  formatApprovals,
   formatBranchLine,
   formatMetaLine,
+  summarizeApprovals,
   tailLines,
   truncateVisible,
   viewTop,
@@ -157,6 +159,89 @@ Deno.test("formatBranchLine shows a drill-down chevron next to the badge", () =>
       expand: "open",
     }),
     "feat/api-client [47/48] ▾",
+  );
+});
+
+Deno.test("summarizeApprovals counts approvals and pending reviewers", () => {
+  assertEquals(
+    summarizeApprovals(
+      [{ state: "APPROVED" }, { state: "COMMENTED" }],
+      [{ login: "a" }],
+    ),
+    { approved: 1, pending: 1, changesRequested: false },
+  );
+});
+
+Deno.test("summarizeApprovals flags changes requested", () => {
+  assertEquals(
+    summarizeApprovals([{ state: "CHANGES_REQUESTED" }], []),
+    { approved: 0, pending: 0, changesRequested: true },
+  );
+});
+
+Deno.test("formatApprovals renders an approved/total badge", () => {
+  // Color is disabled in tests, so only the text is asserted.
+  assertEquals(
+    formatApprovals({ approved: 1, pending: 2, changesRequested: false }),
+    "[1/3]",
+  );
+  assertEquals(
+    formatApprovals({ approved: 3, pending: 0, changesRequested: false }),
+    "[3/3]",
+  );
+  assertEquals(
+    formatApprovals({ approved: 0, pending: 3, changesRequested: false }),
+    "[0/3]",
+  );
+});
+
+Deno.test("formatApprovals counts approvals toward the total when changes requested", () => {
+  assertEquals(
+    formatApprovals({ approved: 1, pending: 1, changesRequested: true }),
+    "[1/2]",
+  );
+});
+
+Deno.test("formatApprovals is empty with no review activity", () => {
+  assertEquals(
+    formatApprovals({ approved: 0, pending: 0, changesRequested: false }),
+    "",
+  );
+});
+
+Deno.test("formatBranchLine puts the approvals badge before checks", () => {
+  assertEquals(
+    formatBranchLine(
+      {
+        ...SAMPLE,
+        approvals: { approved: 1, pending: 1, changesRequested: false },
+      },
+      {
+        showChecks: true,
+        showApprovals: true,
+        showPr: true,
+        current: false,
+      },
+    ),
+    "feat/api-client [1/2] [47/48]",
+  );
+});
+
+Deno.test("formatBranchLine omits approvals when disabled", () => {
+  assertEquals(
+    formatBranchLine(
+      {
+        ...SAMPLE,
+        approvals: { approved: 1, pending: 1, changesRequested: false },
+      },
+      {
+        showChecks: true,
+        showApprovals: false,
+        showPr: true,
+        current: false,
+      },
+    ),
+    "feat/api-client [47/48]",
   );
 });
 

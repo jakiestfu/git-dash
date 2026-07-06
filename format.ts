@@ -99,6 +99,53 @@ function colorFn(name: string): (s: string) => string {
   }
 }
 
+// ── Approvals ────────────────────────────────────────────────────────────────
+// GitHub doesn't expose "N approvals required" via the CLI without hitting the
+// branch-protection API, so we approximate: each APPROVED review is a granted
+// approval, each still-outstanding requested reviewer is a pending slot, and a
+// CHANGES_REQUESTED review blocks. Only the latest review per person counts,
+// which is exactly what `latestReviews` gives us.
+
+export interface ApprovalState {
+  approved: number; // reviewers who approved
+  pending: number; // reviewers still requested (not yet reviewed)
+  changesRequested: boolean; // someone is blocking
+}
+
+// summarizeApprovals: fold latestReviews + still-pending reviewRequests into
+// the counts the badge renders from.
+export function summarizeApprovals(
+  latestReviews: { state?: string }[],
+  reviewRequests: unknown[],
+): ApprovalState {
+  let approved = 0;
+  let changesRequested = false;
+  for (const r of latestReviews) {
+    const s = String(r?.state ?? "").toUpperCase();
+    if (s === "APPROVED") approved += 1;
+    else if (s === "CHANGES_REQUESTED") changesRequested = true;
+  }
+  return { approved, pending: reviewRequests.length, changesRequested };
+}
+
+// formatApprovals: a compact "[approved/total]" badge, mirroring the checks
+// column. Total is everyone involved (approvers + still-requested reviewers).
+// Color reflects state:
+//   [2/3]  red     someone requested changes (blocking)
+//   [3/3]  green   fully approved
+//   [1/3]  yellow  approvals in progress, reviewers still pending
+//   [0/3]  grey    requested, nobody has approved yet
+// Returns "" when no reviewer is involved at all, so quiet PRs stay uncluttered.
+export function formatApprovals(a: ApprovalState): string {
+  const total = a.approved + a.pending;
+  if (total === 0 && !a.changesRequested) return "";
+  const label = `[${a.approved}/${total}]`;
+  if (a.changesRequested) return red(label);
+  if (a.approved >= total) return green(label);
+  if (a.approved > 0) return yellow(label);
+  return dim(label);
+}
+
 // formatBranchLine / formatMetaLine: the two lines every PR row renders as.
 // Shared by the main view and the configure preview so they can't drift.
 // With showPr off there is no meta line, so the delta moves onto the branch
@@ -121,16 +168,22 @@ export function formatBranchLine(
     adds: number;
     dels: number;
     ahead: string;
+    approvals?: ApprovalState;
   },
   opts: {
     showChecks: boolean;
     showPr: boolean;
+    showApprovals?: boolean;
     current: boolean;
     expand?: "open" | "closed";
   },
 ): string {
   const name = opts.current ? `${pr.branch}*` : pr.branch;
   let bname = opts.current ? bold(cyan(name)) : cyan(name);
+  if (opts.showApprovals && pr.approvals) {
+    const badge = formatApprovals(pr.approvals);
+    if (badge) bname += ` ${badge}`;
+  }
   if (opts.showChecks && pr.checks) {
     bname += ` ${colorFn(pr.checksColor)(`[${pr.checks}]`)}`;
     if (opts.expand) bname += ` ${dim(opts.expand === "open" ? "▾" : "▸")}`;

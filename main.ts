@@ -27,9 +27,11 @@ import {
   x,
 } from "./subprocess.ts";
 import {
+  type ApprovalState,
   boxed,
   formatBranchLine,
   formatMetaLine,
+  summarizeApprovals,
   tailLines,
   viewTop,
   visibleWidth,
@@ -40,6 +42,7 @@ import { type CliOptions, type Mode, parseArgs } from "./cli.ts";
 // Per-repo settings live in one JSON file in the user's home directory:
 //   { "repos": { "owner/repo": { "showChecks": true,
 //                                "showPr": true,
+//                                "showApprovals": true,
 //                                "autoRefresh": 30,
 //                                "actions": { "t": { "workflow": "x.yml",
 //                                                    "name": "X" } } } } }
@@ -53,6 +56,7 @@ const CONFIG_FILE = Deno.env.get("GIT_DASH_CONFIG") ??
   `${Deno.env.get("HOME")}/.git-dash.json`;
 let SHOW_CHECKS = true;
 let SHOW_PR = true; // PR number/title line under each branch
+let SHOW_APPROVALS = true; // review approval status on each PR
 let AUTO_REFRESH = 0; // seconds between auto-refreshes; 0 = off
 let ACTIONS = new Map<string, ActionBinding>();
 
@@ -86,12 +90,14 @@ function configLoad(): void {
   ACTIONS = new Map();
   SHOW_CHECKS = true;
   SHOW_PR = true;
+  SHOW_APPROVALS = true;
   AUTO_REFRESH = 0;
   if (!REPO_SLUG) return;
   const repo = readJsonFile(CONFIG_FILE)?.repos?.[REPO_SLUG];
   if (!repo) return;
   if (repo.showChecks === false) SHOW_CHECKS = false;
   if (repo.showPr === false) SHOW_PR = false;
+  if (repo.showApprovals === false) SHOW_APPROVALS = false;
   if (AUTO_REFRESH_STEPS.includes(repo.autoRefresh)) {
     AUTO_REFRESH = repo.autoRefresh;
   }
@@ -115,6 +121,7 @@ function configSave(): void {
       [REPO_SLUG]: {
         showChecks: SHOW_CHECKS,
         showPr: SHOW_PR,
+        showApprovals: SHOW_APPROVALS,
         autoRefresh: AUTO_REFRESH,
         actions,
       },
@@ -200,6 +207,7 @@ function restoreRows(rows: Row[]): void {
         checks: row.checks,
         checksColor: row.checksColor,
         items: row.checkItems,
+        approvals: row.approvals,
         url: row.url,
       });
     }
@@ -228,6 +236,7 @@ interface PrInfo {
   checks: string;
   checksColor: string;
   items: CheckItem[];
+  approvals?: ApprovalState;
   // Direct PR URL — only needed in --all mode, where rows live in other repos
   // and can't be opened with `gh pr view <num>` against the current repo.
   url?: string;
@@ -301,7 +310,7 @@ export function extractCheckItems(rollup: unknown[]): CheckItem[] {
 function prInfoOf(pr: any): PrInfo {
   const rollup = pr.statusCheckRollup ?? [];
   const { checks, checksColor } = summarizeChecks(rollup);
-  return {
+  const info: PrInfo = {
     base: pr.baseRefName,
     num: String(pr.number),
     adds: pr.additions ?? 0,
@@ -312,12 +321,20 @@ function prInfoOf(pr: any): PrInfo {
     checksColor,
     items: extractCheckItems(rollup),
   };
+  if (pr.latestReviews !== undefined || pr.reviewRequests !== undefined) {
+    info.approvals = summarizeApprovals(
+      pr.latestReviews ?? [],
+      pr.reviewRequests ?? [],
+    );
+  }
+  return info;
 }
 
 function prFields(): string {
   let f =
     "number,title,headRefName,baseRefName,additions,deletions,isDraft,state";
   if (SHOW_CHECKS) f += ",statusCheckRollup";
+  if (SHOW_APPROVALS) f += ",reviewDecision,latestReviews,reviewRequests";
   return f;
 }
 
@@ -345,6 +362,7 @@ interface Row {
   checks: string;
   checksColor: string;
   checkItems: CheckItem[];
+  approvals?: ApprovalState;
   // Direct PR URL, set in --all mode; empty for same-repo rows.
   url: string;
   // Display name for the row's first line. Defaults to `branch`; --all sets it
@@ -379,6 +397,7 @@ function addRow(branch: string, parent: string, depth: number): void {
     checks: pr?.checks ?? "",
     checksColor: pr?.checksColor ?? "",
     checkItems: pr?.items ?? [],
+    approvals: pr?.approvals,
     url: pr?.url ?? "",
   });
 }
@@ -1100,8 +1119,8 @@ interface Workflow {
 
 // Settings-tab state. Workflows load lazily the first time the tab is opened
 // (SETTINGS_LOADED guards the fetch); CSEL is the settings cursor, mirroring
-// the stack tab's SEL. The first three rows are the toggles; rows 3.. map to
-// WORKFLOWS[CSEL - 3].
+// the stack tab's SEL. Row 0 is the config-file row, rows 1..4 the toggles, and
+// rows 5.. map to WORKFLOWS[CSEL - 5].
 const WORKFLOWS: Workflow[] = [];
 let SETTINGS_LOADED = false;
 let CSEL = 0;
@@ -1125,11 +1144,13 @@ const SETTINGS_PREVIEW = {
   adds: 412,
   dels: 18,
   ahead: "2",
+  approvals: { approved: 1, pending: 1, changesRequested: false },
 };
 
-// The settings cursor can land on the three toggles plus one row per workflow.
+// The settings cursor rows, top to bottom: the config-file row (0), the four
+// toggles (1..4), then one row per workflow (5..). WORKFLOWS[CSEL - 5].
 function settingsLast(): number {
-  return WORKFLOWS.length + 2;
+  return WORKFLOWS.length + 4;
 }
 
 async function loadSettings(): Promise<void> {
@@ -1159,6 +1180,17 @@ function buildSettingsLines(): void {
   buildHeader();
   LINES = [];
 
+  // The config-file row sits at the top so it's the first thing the cursor
+  // lands on; enter/space/→ hands the path to the platform opener.
+  let cur = " ";
+  if (CSEL === 0) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
+  LINES.push(`  ${dim("Config File")}`);
+  LINES.push(`  ${cur} ${cyan(CONFIG_FILE)}`);
+  LINES.push("");
+
   // The preview PR renders through the same formatters as the stack view,
   // inside a bordered box so it reads as a self-contained sample. boxed()
   // truncates any line that would overrun the border, so the inner width can
@@ -1168,6 +1200,7 @@ function buildSettingsLines(): void {
     `${cyan("●")} ${
       formatBranchLine(SETTINGS_PREVIEW, {
         showChecks: SHOW_CHECKS,
+        showApprovals: SHOW_APPROVALS,
         showPr: SHOW_PR,
         current: false,
         expand: "closed",
@@ -1177,30 +1210,18 @@ function buildSettingsLines(): void {
   if (SHOW_PR) {
     preview.push(`  ${formatMetaLine(SETTINGS_PREVIEW, termCols(), 1)}`);
   }
-  LINES.push(...boxed("preview", preview, previewInner));
+  LINES.push(...boxed("Preview", preview, previewInner));
   LINES.push("");
-
-  let cur = " ";
-  if (CSEL === 0) {
-    cur = bold(cyan("❯"));
-    SEL_LINE = LINES.length;
-  }
-  const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
-  LINES.push(
-    `  ${cur} Show checks ${state} ${
-      dim("· [passed/total] check status on each PR")
-    }`,
-  );
 
   cur = " ";
   if (CSEL === 1) {
     cur = bold(cyan("❯"));
     SEL_LINE = LINES.length;
   }
-  const pr = SHOW_PR ? green("[on]") : dim("[off]");
+  const state = SHOW_CHECKS ? green("[on]") : dim("[off]");
   LINES.push(
-    `  ${cur} Show pull request ${pr} ${
-      dim("· PR number/title line under each branch")
+    `  ${cur} Show Checks ${state} ${
+      dim("· [passed/total] check status on each PR")
     }`,
   );
 
@@ -1209,21 +1230,45 @@ function buildSettingsLines(): void {
     cur = bold(cyan("❯"));
     SEL_LINE = LINES.length;
   }
+  const pr = SHOW_PR ? green("[on]") : dim("[off]");
+  LINES.push(
+    `  ${cur} Show Pull Request ${pr} ${
+      dim("· PR number/title line under each branch")
+    }`,
+  );
+
+  cur = " ";
+  if (CSEL === 3) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
+  const approvals = SHOW_APPROVALS ? green("[on]") : dim("[off]");
+  LINES.push(
+    `  ${cur} Show Approvals ${approvals} ${
+      dim("· review approval status on each PR")
+    }`,
+  );
+
+  cur = " ";
+  if (CSEL === 4) {
+    cur = bold(cyan("❯"));
+    SEL_LINE = LINES.length;
+  }
   const refresh = AUTO_REFRESH > 0
     ? green(`[${formatCountdown(AUTO_REFRESH)}]`)
     : dim("[off]");
   LINES.push(
-    `  ${cur} Auto refresh ${refresh} ${dim("· re-fetch PRs periodically")}`,
+    `  ${cur} Auto Refresh ${refresh} ${dim("· re-fetch PRs periodically")}`,
   );
   LINES.push("");
 
-  LINES.push(`  ${dim("action keys")}`);
+  LINES.push(`  ${dim("Action Keys")}`);
   if (WORKFLOWS.length === 0) {
-    LINES.push(`      ${dim("no active workflows found in this repo")}`);
+    LINES.push(`      ${dim("No active workflows found in this repo")}`);
   }
   for (let i = 0; i < WORKFLOWS.length; i++) {
     cur = " ";
-    if (CSEL === i + 3) {
+    if (CSEL === i + 5) {
       cur = bold(cyan("❯"));
       SEL_LINE = LINES.length;
     }
@@ -1240,11 +1285,13 @@ function buildSettingsLines(): void {
   // and quit are implicit (quit lives in the header).
   FOOTER = [""];
   const parts: string[] = [];
-  if (CSEL <= 2) {
+  if (CSEL === 0) {
+    parts.push("enter open");
+  } else if (CSEL <= 4) {
     parts.push("space toggle");
   } else {
     parts.push("a-z 0-9 bind");
-    if (keyOfWf(WORKFLOWS[CSEL - 3]?.id ?? "")) {
+    if (keyOfWf(WORKFLOWS[CSEL - 5]?.id ?? "")) {
       parts.push("enter rename");
       parts.push("esc unbind");
     }
@@ -1260,7 +1307,7 @@ function buildSettingsLines(): void {
 // only stored in the local user's config. Reads one echoed line below the UI,
 // which paint() then reclaims.
 async function renameSelectedAction(): Promise<void> {
-  const wf = WORKFLOWS[CSEL - 3];
+  const wf = WORKFLOWS[CSEL - 5];
   const k = keyOfWf(wf.id);
   if (!k) {
     CMSG = "bind a key before renaming";
@@ -1282,33 +1329,44 @@ async function handleSettingsKey(key: string): Promise<boolean> {
     if (CSEL > 0) CSEL -= 1;
   } else if (key === "\x1b[B" || key === "j") {
     if (CSEL < settingsLast()) CSEL += 1;
-  } else if (key === " " || key === "\r" || key === "\n") {
+  } else if (
+    key === " " || key === "\r" || key === "\n" || key === "\x1b[C"
+  ) {
+    // enter/space/→ acts on the selected row: open the config file, flip a
+    // toggle, or rename a bound action. → only means "open" on the config row.
     if (CSEL === 0) {
+      await openUrl(CONFIG_FILE);
+    } else if (key === "\x1b[C") {
+      // → is a no-op on the toggle/workflow rows.
+    } else if (CSEL === 1) {
       SHOW_CHECKS = !SHOW_CHECKS;
       configSave();
-    } else if (CSEL === 1) {
+    } else if (CSEL === 2) {
       SHOW_PR = !SHOW_PR;
       configSave();
-    } else if (CSEL === 2) {
+    } else if (CSEL === 3) {
+      SHOW_APPROVALS = !SHOW_APPROVALS;
+      configSave();
+    } else if (CSEL === 4) {
       AUTO_REFRESH = nextAutoRefresh(AUTO_REFRESH);
       configSave();
     } else if (key !== " ") {
       await renameSelectedAction();
     }
   } else if (key === "\x1b") {
-    if (CSEL > 2) {
-      const k = keyOfWf(WORKFLOWS[CSEL - 3].id);
+    if (CSEL > 4) {
+      const k = keyOfWf(WORKFLOWS[CSEL - 5].id);
       if (k) {
         ACTIONS.delete(k);
         configSave();
       }
     }
   } else if (/^[a-z0-9]$/.test(key)) {
-    if (CSEL > 2) {
+    if (CSEL > 4) {
       if (RESERVED_KEYS.includes(key)) {
         CMSG = `'${key}' is reserved (${RESERVED_KEYS})`;
       } else {
-        const wf = WORKFLOWS[CSEL - 3];
+        const wf = WORKFLOWS[CSEL - 5];
         const prev = keyOfWf(wf.id);
         if (prev) ACTIONS.delete(prev);
         // Assigning an already-used key steals it from the other workflow.
@@ -1382,8 +1440,9 @@ function actionHints(): string {
 }
 
 // buildHeader: the pinned top rows shared by both tabs — a blank spacer, the
-// tab bar, the repo slug, and a blank separator. Non-interactive output has no
-// tabs, so it keeps the old single-line "dash · slug" title in LINES instead.
+// tab bar, a blank separator, the repo line, and a trailing blank. Non-
+// interactive output has no tabs, so it keeps the old single-line "dash · slug"
+// title in LINES instead.
 function buildHeader(): void {
   if (!INTERACTIVE) {
     HEADER = [];
@@ -1397,10 +1456,14 @@ function buildHeader(): void {
     const gap = termCols() - 2 - visibleWidth(left) - visibleWidth(status);
     bar = `${left}${" ".repeat(Math.max(gap, 1))}${status}`;
   }
+  // The bold slug reads as the title of what's below; a blank line sets it off
+  // from the tab bar.
+  const repo = bold(cyan(REPO_SLUG || "local"));
   HEADER = [
     "",
     bar,
-    dim(`  ${REPO_SLUG || "local"}`),
+    "",
+    `  ${repo}`,
     "",
   ];
 }
@@ -1463,6 +1526,9 @@ function buildLines(): void {
       { ...row, branch: row.display ?? row.branch },
       {
         showChecks: SHOW_CHECKS,
+        // Overviews are cross-repo (gh search) and carry no review data, so
+        // suppress the approvals badge there.
+        showApprovals: isOverview() ? false : SHOW_APPROVALS,
         // showPr:false appends the diff delta to the branch line; overviews
         // have no delta data, so keep it true there to suppress it.
         showPr: isOverview() ? true : SHOW_PR,
@@ -1895,6 +1961,68 @@ function runUpgrade(): never {
   Deno.exit(0);
 }
 
+// initialLoad: the first fetch of the session, run off the main task so the UI
+// stays interactive (tab-switch, scroll cached rows, open Settings) while it
+// works. Mirrors refreshData's "build into scratch, swap in one burst" so
+// cached rows never blank; on total failure with no cache it surfaces the error
+// via INFO rather than throwing (there's a live UI to show it in).
+async function initialLoad(): Promise<void> {
+  LOADING = true;
+  const spin = setInterval(() => {
+    SPIN_I += 1;
+    render();
+  }, 80);
+  const selBranch = ROWS[SEL]?.branch ?? "";
+  const hadCache = ROWS.length > 0;
+  let loadErr = "";
+  try {
+    await loadStack(() => render());
+    STALE = false;
+    INFO = "";
+  } catch (e) {
+    loadErr = e instanceof Error ? e.message : String(e);
+    if (hadCache) INFO = "showing cached data — reload failed";
+  }
+  clearInterval(spin);
+  LOADING = false;
+
+  if (ROWS.length === 0 && loadErr) {
+    // Nothing to show and no cache to fall back on. With a live UI we can't
+    // throw, so show the error in place.
+    INFO = loadErr;
+    render();
+    return;
+  }
+  SEL = ROW_OF.get(selBranch) ?? ROW_OF.get(CUR_BRANCH) ?? 1;
+  render();
+
+  // Overviews are cross-repo: skip the git stats and origin fetch (they only
+  // make sense for branches in the current repo) but still cache the rows.
+  const localStack = !isOverview();
+
+  // Local git stats are cheap (no network) — compute and paint them now.
+  if (ROWS.length > 0 && localStack && !BUSY) {
+    await loadGitStats();
+    saveStackCache();
+    render();
+  } else if (ROWS.length > 0) {
+    saveStackCache();
+  }
+
+  // Fetch origin and refresh behind/ahead counts in place; the UI is already
+  // fully usable while this runs.
+  if (ROWS.length > 0 && ROOTS.length > 0 && localStack) {
+    for (const root of ROOTS) {
+      await tryOut("git", ["fetch", "origin", root, "--quiet"]);
+    }
+    if (!BUSY) {
+      await loadGitStats();
+      saveStackCache();
+      render();
+    }
+  }
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -1974,64 +2102,12 @@ async function main(): Promise<void> {
   }
   render();
 
-  // 2. Load PRs, animating the header spinner. The loaders build into scratch
-  //    and swap the stack in one burst, so cached rows (if any) stay on screen
-  //    the whole time and are replaced only once fresh data is ready. On
-  //    failure the cache remains untouched.
-  LOADING = true;
-  const spin = setInterval(() => {
-    SPIN_I += 1;
-    render();
-  }, 80);
-  const selBranch = ROWS[SEL]?.branch ?? "";
-  const hadCache = ROWS.length > 0;
-  let loadErr = "";
-  try {
-    await loadStack(() => render());
-    STALE = false;
-    INFO = "";
-  } catch (e) {
-    loadErr = e instanceof Error ? e.message : String(e);
-    if (hadCache) INFO = "showing cached data — reload failed";
-  }
-  clearInterval(spin);
-  LOADING = false;
-  render();
-
-  if (ROWS.length === 0 && loadErr) {
-    // Nothing to show and no cache to fall back on.
-    if (!startOnSettings) throw new Error(loadErr);
-    INFO = loadErr;
-  }
-  SEL = ROW_OF.get(selBranch) ?? ROW_OF.get(CUR_BRANCH) ?? 1;
-
-  // Overviews are cross-repo: skip the git stats and origin fetch (they only
-  // make sense for branches in the current repo) but still cache the rows.
-  const localStack = !isOverview();
-
-  // 3. Local git stats are cheap (no network) — compute and paint them now.
-  if (ROWS.length > 0 && localStack) {
-    await loadGitStats();
-    saveStackCache();
-    render();
-  } else if (ROWS.length > 0) {
-    saveStackCache();
-  }
-
-  // 4. Fetch origin in the background and refresh behind/ahead counts in
-  //    place; the UI is already fully usable while this runs.
-  if (ROWS.length > 0 && ROOTS.length > 0 && localStack) {
-    (async () => {
-      for (const root of ROOTS) {
-        await tryOut("git", ["fetch", "origin", root, "--quiet"]);
-      }
-      if (!BUSY) {
-        await loadGitStats();
-        saveStackCache();
-        render();
-      }
-    })();
-  }
+  // 2. Load PRs in the background so the session is interactive immediately —
+  //    the user can switch tabs, scroll cached rows, and open Settings while
+  //    the fetch runs. The loaders build into scratch and swap the stack in one
+  //    burst, so cached rows (if any) stay on screen until fresh data is ready.
+  //    Everything runs off the main task; render() is safe to call from here.
+  void initialLoad();
 
   if (AUTO_REFRESH > 0) {
     REFRESH_LEFT = AUTO_REFRESH;

@@ -185,6 +185,12 @@ Deno.test("cli rejects unknown options", async () => {
   assert(r.stdout.includes("Unknown option: --bogus"));
 });
 
+Deno.test("cli rejects an invalid --scope value", async () => {
+  const r = await runCli(["--scope=bogus"]);
+  assertEquals(r.code, 1);
+  assert(r.stderr.includes("--scope must be one of"));
+});
+
 Deno.test("cli --dir with a missing path fails cleanly", async () => {
   const r = await runCli(["--dir", "/nonexistent/path"]);
   assertEquals(r.code, 1);
