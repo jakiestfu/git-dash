@@ -43,9 +43,8 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 The installer downloads the prebuilt standalone binary for your platform from
-the [latest release](https://github.com/jakiestfu/git-dash/releases) (no Deno
-needed), falling back to running from source with Deno when no binary matches.
-Install elsewhere with `PREFIX=/usr/local/bin bash install.sh`.
+the [latest release](https://github.com/jakiestfu/git-dash/releases) — no Deno
+needed. Install elsewhere with `PREFIX=/usr/local/bin bash install.sh`.
 
 Already installed? Update in place any time:
 
@@ -57,8 +56,7 @@ git dash upgrade | bash
 
 - `git`
 - [`gh`](https://cli.github.com), authenticated
-- [Deno](https://deno.com) 2.x — only when running from source (no prebuilt
-  binary for your platform)
+- [Deno](https://deno.com) 2.x — only for [developing](#developing)
 
 ## Usage
 
