@@ -5,61 +5,23 @@ PRs following the lead — whether that's one branch against `main` or a
 three-deep chain. `git dash` shows the whole stack at a glance and rebases the
 entire chain with one keystroke.
 
+<img src="./preview.svg" width="100%" />
+
 ## Features
 
-- **See the stack, not one PR at a time.** The root renders at the top; each PR
-  sits one level below its parent. Approvals, checks (`[passed/total]`), diff
-  size, and how far each branch is ahead all show inline.
-- **Rebase the whole chain with `r`.** Fast-forwards the root from origin, then
-  rebases every branch bottom-up and force-pushes each with `--force-with-lease`
-  — recording fork points first so a parent's commits are never replayed as
-  duplicates. Aborts cleanly on conflict and leaves your tree as it was.
-- **See approvals at a glance.** An `[approved/total]` badge that greys while
-  reviews are outstanding, turns green once fully approved, and goes red when
-  someone requests changes.
-- **Drill into checks.** Expand any PR to see each check with a ✓/✗/pending
-  glyph (failures first) and open it in the browser.
-- **Pick your scope.** The tabs across the top are named after what they cover:
-  the **repo** (your PRs here, the default, current branch highlighted), the
-  **owner/org** (your PRs across it), and **you** (all your open PRs on GitHub).
-  `Tab` / `Shift-Tab` switch between them, or set `--scope`.
-- **Bind keys to GitHub Actions.** Map a key to a workflow and dispatch it on
-  the selected branch — share the bindings with your team as a JSON fragment.
-- **Instant startup.** The window paints immediately from a per-repo cache and
-  loads fresh data in the background — switch tabs and scroll while it fetches.
-
-```
-  hello-world  │    acme  │    octocat   · tab/⇧tab switch                      s settings
-
-  acme/hello-world · feat/profile-avatar
-
-    ● main · 2 behind origin
-     ● feat/api-client [2/2] [5/5] ▸
-       #128 Add API client  +412 −18 · 2 ahead
-      ● feat/user-profile [1/2] [3/5] ▸
-        #131 User profile page  +286 −40 · 5 ahead
-     ❯ ● feat/profile-avatar* [1/2] [2/3] ▸
-         #134 Avatar upload  +190 −22 · 3 ahead
-
-  → checks · r rebase · c checkout
-  d deploy · e e2e tests
-  q quit                                                                            ↻ 27s
-```
-
-The scope tabs are named for what they show — here the repo `hello-world`, the
-owner `acme`, and the user `octocat`; the active one is purple. `s settings`
-(top-right) opens Settings. The repo slug and current branch sit just below, and
-the bottom row carries `q quit` on the left and the load/refresh state on the
-right.
-
-Filled radios (`●`) mark the branches your current selection would rebase — the
-root plus every branch up to the selected row (whose radio is bold); empty
-radios (`○`) are left untouched. The `[approved/total]` approval badge sits
-right after the branch name (here `feat/api-client` is fully approved,
-`feat/user-profile` is waiting on one more, and `feat/profile-avatar` has
-changes requested — shown in red). The branch you're on is marked with `*`, and
-a `▸` after the checks badge means you can drill in. Bound action keys (here `d`
-and `e`) get their own footer line.
+- **See the whole stack** — PRs render as a tree under their root branch, with
+  approvals, checks, diff size, and ahead-counts inline.
+- **Rebase the chain with one key** — `r` updates the root from origin, then
+  rebases and force-pushes every branch in order. Conflicts abort cleanly and
+  leave your repo as it was.
+- **Drill into checks** — expand a PR to see each check and open it in the
+  browser.
+- **Three scopes** — this repo, your org, or all your PRs on GitHub. Switch with
+  `Tab`.
+- **Dispatch GitHub Actions** — bind workflows to keys and share the bindings
+  with your team.
+- **Instant startup** — paints immediately from cache and refreshes in the
+  background.
 
 ## Install
 
@@ -80,9 +42,10 @@ This installs `git-dash` to `~/.local/bin`. If that directory isn't on your
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install elsewhere with `PREFIX=/usr/local/bin bash install.sh`. Prefer a
-standalone binary with no Deno dependency? Grab a prebuilt one for your platform
-from the [Releases page](https://github.com/jakiestfu/git-dash/releases).
+The installer downloads the prebuilt standalone binary for your platform from
+the [latest release](https://github.com/jakiestfu/git-dash/releases) (no Deno
+needed), falling back to running from source with Deno when no binary matches.
+Install elsewhere with `PREFIX=/usr/local/bin bash install.sh`.
 
 Already installed? Update in place any time:
 
@@ -94,7 +57,8 @@ git dash upgrade | bash
 
 - `git`
 - [`gh`](https://cli.github.com), authenticated
-- [Deno](https://deno.com) 2.x (not needed for a prebuilt binary from Releases)
+- [Deno](https://deno.com) 2.x — only when running from source (no prebuilt
+  binary for your platform)
 
 ## Usage
 
@@ -108,16 +72,9 @@ git dash --dir ./some-repo   # run against another directory's repository
 git dash upgrade | bash      # update git-dash in place
 ```
 
-`--scope` selects which PRs to show; it defaults to `yours` — all the PRs you've
-authored in this repo, grouped into stacks, with the current branch's PR
-selected on open. `--scope=org` and `--scope=all` widen that across repos via
-`gh search prs`; since the cross-repo search exposes less detail (no base
-branch, diff size, checks, or approvals), those are read-only overviews grouped
-by repo — `enter` opens the selected PR on GitHub.
-
-The scope tabs boot instantly from a per-scope cache and load fresh data in the
-background; navigating, opening PRs, and switching tabs stay responsive
-throughout, and the load/refresh state shows bottom-right.
+The default scope shows the PRs you've authored in this repo, grouped into
+stacks. `org` and `all` are read-only overviews of your PRs across repos —
+`enter` opens the selected PR on GitHub.
 
 ## Keys
 
@@ -136,10 +93,8 @@ throughout, and the load/refresh state shows bottom-right.
   branch; press again once the run is up to open it
 - `q` — quit
 
-A refresh never locks the UI — you can keep navigating and opening PRs while it
-runs; only rebase/checkout/dispatch wait for it to finish. The footer lists only
-the actions distinctive to the current selection — navigation, scope-switching,
-`enter` to open, and `q` are implicit.
+Refreshes never lock the UI — only rebase, checkout, and dispatch wait for one
+to finish.
 
 ## Configure
 
@@ -152,7 +107,7 @@ change settings:
 - **Show Checks** — toggle the `[passed/total]` column.
 - **Show Pull Request** — toggle the `#num title  +adds −dels · ahead` line
   under each branch. When hidden, the delta moves onto the branch line.
-- **Show Approvals** — toggle the review-approval badge on each PR (see below).
+- **Show Approvals** — toggle the `[approved/total]` review badge on each PR.
 - **Auto Refresh** — cycle `off → 30s → 1m → 5m`; the stack re-fetches on that
   interval with a countdown in the header, and `R` refreshes on demand.
 - **Action Keys** — bind any active GitHub Actions workflow to a key (`a-z`,
@@ -202,9 +157,7 @@ deno task test       # run the test suite
 deno task compile    # build a standalone binary into dist/git-dash
 ```
 
-The tool is a small set of TypeScript modules run directly by Deno via `main.ts`
-(the installer copies it into place). It has no third-party dependencies beyond
-the Deno standard library. Tagging a release
-(`git tag v1.x.y && git push
---tags`) makes CI compile binaries for Linux and
-macOS and attach them to a GitHub release.
+git dash is a handful of TypeScript modules run directly by Deno, with no
+dependencies beyond the Deno standard library. Every merge to `main` cuts a
+release: CI compiles standalone binaries for Linux and macOS and attaches them
+to a GitHub release.

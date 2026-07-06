@@ -40,20 +40,38 @@ fetch() {
 	fi
 }
 
+# The sources git-dash runs from: main.ts plus its sibling modules, and
+# deno.json for the @std import map. They live together in git-dash.d/ so the
+# relative imports and bare specifiers resolve; the git-dash entry on PATH is
+# a thin wrapper pointing at them.
+FILES=(main.ts cli.ts colors.ts format.ts subprocess.ts deno.json)
+APP_DIR="$INSTALL_DIR/git-dash.d"
+
+tmp=$(mktemp -d -t git-dash-install.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
 if [[ "$MODE" == local ]]; then
 	gray "  Installing git-dash"
-	cp -f "$SCRIPT_DIR/main.ts" "$INSTALL_DIR/git-dash"
+	for f in "${FILES[@]}"; do
+		cp -f "$SCRIPT_DIR/$f" "$tmp/$f"
+	done
 else
 	gray "  Downloading git-dash"
-	tmp=$(mktemp -d -t git-dash-install.XXXXXX)
-	trap 'rm -rf "$tmp"' EXIT
-	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/main.ts" "$tmp/git-dash"
-	mv "$tmp/git-dash" "$INSTALL_DIR/git-dash"
+	for f in "${FILES[@]}"; do
+		fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/$f" "$tmp/$f"
+	done
 fi
-chmod +x "$INSTALL_DIR/git-dash"
 
-# Remove the subcommand directory left behind by older versions.
-rm -rf "$INSTALL_DIR/git-dash.d"
+# Swap the whole directory in one go so a half-fetched download never
+# replaces a working install.
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR"
+mv "$tmp"/* "$APP_DIR/"
+
+cat >"$INSTALL_DIR/git-dash" <<EOF
+#!/usr/bin/env bash
+exec deno run --quiet --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net "$APP_DIR/main.ts" "\$@"
+EOF
+chmod +x "$INSTALL_DIR/git-dash"
 
 green "Installed."
 
