@@ -19,14 +19,15 @@ export interface CliOptions {
   configImport: string;
 }
 
-const HELP = `Usage: git convoy [OPTIONS]     (also installed as: git cv)
+const HELP = `Usage: git dash [OPTIONS]
 
 Interactive view of the PR stack containing the current branch. The root
 branch renders at the top; each PR below it, indented one space per level.
 Filled radios (●) mark the branches the current selection would rebase;
 empty radios (○) are left untouched.
 
-The session has two tabs — Stack and Settings — switched with Tab / Shift-Tab.
+The session has two tabs — Pull Requests and Settings — switched with Tab /
+Shift-Tab.
 
 OPTIONS:
   --current       Show the current branch's PR and its ancestors (default)
@@ -39,21 +40,23 @@ OPTIONS:
                   Open the session onto the Settings tab: toggle the checks
                   column and the PR detail line, set the auto-refresh interval,
                   and bind keys to GitHub Actions workflows. Tab switches to the
-                  Stack tab from there. With a URL (or local path) to a shared
-                  JSON file, its action bindings are downloaded and merged into
-                  this repo's config first — handy for sharing team configs
+                  Pull Requests tab from there. With a URL (or local path) to a
+                  shared JSON file, its action bindings are downloaded and
+                  merged into this repo's config first — handy for sharing team
+                  configs
   --dir <path>    Run against the git repository at <path> instead of the
                   current directory
   --no-push       Rebase locally only; skip force-pushing
   -h, --help      Show this help message
 
 COMMANDS:
-  upgrade         Print the install command to update git-convoy; pipe it to a
-                  shell to run it:  git cv upgrade | bash
+  upgrade         Print the install command to update git-dash; pipe it to a
+                  shell to run it:  git dash upgrade | bash
 
 Keys are shown in-app: the footer lists the actions for the current selection,
-and the header shows the Stack / Settings tabs. Settings are saved per-repo in
-~/.git-convoy.json.`;
+and the header shows the Pull Requests / Settings tabs. Settings are saved
+per-repo in
+~/.git-dash.json.`;
 
 // The mutually-exclusive view flags; the last one given wins (matching the old
 // loop). --configure also switches to the settings tab.
@@ -69,7 +72,7 @@ export function parseArgs(args: string[]): CliOptions {
       // unknown option-like tokens, as the old parser did.
       if (arg.startsWith("-")) {
         console.log(`Unknown option: ${arg}`);
-        console.log("Run 'git convoy --help' for usage information");
+        console.log("Run 'git dash --help' for usage information");
         Deno.exit(1);
       }
       return true;

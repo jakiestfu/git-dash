@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GITHUB_REPO="${GIT_CONVOY_REPO:-jakiestfu/git-convoy}"
-GITHUB_REF="${GIT_CONVOY_REF:-main}"
+GITHUB_REPO="${GIT_DASH_REPO:-jakiestfu/git-dash}"
+GITHUB_REF="${GIT_DASH_REF:-main}"
 INSTALL_DIR="${PREFIX:-$HOME/.local/bin}"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -23,7 +23,7 @@ else
 	MODE=remote
 fi
 
-bold "Installing git-convoy to $INSTALL_DIR"
+bold "Installing git-dash to $INSTALL_DIR"
 gray "  source: $MODE${MODE:+ ($GITHUB_REPO@$GITHUB_REF)}"
 
 mkdir -p "$INSTALL_DIR"
@@ -41,22 +41,19 @@ fetch() {
 }
 
 if [[ "$MODE" == local ]]; then
-	gray "  Installing git-convoy"
-	cp -f "$SCRIPT_DIR/main.ts" "$INSTALL_DIR/git-convoy"
+	gray "  Installing git-dash"
+	cp -f "$SCRIPT_DIR/main.ts" "$INSTALL_DIR/git-dash"
 else
-	gray "  Downloading git-convoy"
-	tmp=$(mktemp -d -t git-convoy-install.XXXXXX)
+	gray "  Downloading git-dash"
+	tmp=$(mktemp -d -t git-dash-install.XXXXXX)
 	trap 'rm -rf "$tmp"' EXIT
-	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/main.ts" "$tmp/git-convoy"
-	mv "$tmp/git-convoy" "$INSTALL_DIR/git-convoy"
+	fetch "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_REF/main.ts" "$tmp/git-dash"
+	mv "$tmp/git-dash" "$INSTALL_DIR/git-dash"
 fi
-chmod +x "$INSTALL_DIR/git-convoy"
+chmod +x "$INSTALL_DIR/git-dash"
 
 # Remove the subcommand directory left behind by older versions.
-rm -rf "$INSTALL_DIR/git-convoy.d"
-
-gray "  Installing git-cv alias"
-ln -sf "$INSTALL_DIR/git-convoy" "$INSTALL_DIR/git-cv"
+rm -rf "$INSTALL_DIR/git-dash.d"
 
 green "Installed."
 
@@ -72,9 +69,9 @@ if ((${#missing_runtime_deps[@]} > 0)); then
 fi
 
 case ":$PATH:" in
-*":$INSTALL_DIR:"*) gray "  Try it: git cv  (or git convoy)" ;;
+*":$INSTALL_DIR:"*) gray "  Try it: git dash" ;;
 *)
-	yellow "  $INSTALL_DIR is not on your PATH; add it to use 'git cv':"
+	yellow "  $INSTALL_DIR is not on your PATH; add it to use 'git dash':"
 	gray "    export PATH=\"$INSTALL_DIR:\$PATH\""
 	;;
 esac
