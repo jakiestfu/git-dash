@@ -175,6 +175,7 @@ export function formatBranchLine(
     showPr: boolean;
     showApprovals?: boolean;
     current: boolean;
+    draft?: boolean;
     expand?: "open" | "closed";
   },
 ): string {
@@ -186,7 +187,11 @@ export function formatBranchLine(
   }
   if (opts.showChecks && pr.checks) {
     bname += ` ${colorFn(pr.checksColor)(`[${pr.checks}]`)}`;
-    if (opts.expand) bname += ` ${dim(opts.expand === "open" ? "▾" : "▸")}`;
+  }
+  if (opts.draft) bname += ` ${yellow("[draft]")}`;
+  // The drill-down chevron stays last so nothing renders past it.
+  if (opts.showChecks && pr.checks && opts.expand) {
+    bname += ` ${dim(opts.expand === "open" ? "▾" : "▸")}`;
   }
   if (!opts.showPr) bname += ` ${formatDelta(pr)}`;
   return bname;

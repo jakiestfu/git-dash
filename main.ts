@@ -1539,14 +1539,13 @@ function buildLines(): void {
         // have no delta data, so keep it true there to suppress it.
         showPr: isOverview() ? true : SHOW_PR,
         current: row.branch === CUR_BRANCH,
+        draft: row.draft,
         expand: row.checkItems.length > 0
           ? (isExpanded(i) ? "open" : "closed")
           : undefined,
       },
     );
-    let note = "";
-    if (row.draft) note = ` ${yellow("[draft]")}`;
-    if (row.note) note += grey(` · ${row.note}`);
+    const note = row.note ? grey(` · ${row.note}`) : "";
     LINES.push(`  ${ind}${cursor} ${g} ${bname}${note}`);
 
     // Overview rows have only a number to show below the title; same-repo rows

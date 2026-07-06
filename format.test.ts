@@ -162,6 +162,19 @@ Deno.test("formatBranchLine shows a drill-down chevron next to the badge", () =>
   );
 });
 
+Deno.test("formatBranchLine puts the draft tag before the chevron", () => {
+  assertEquals(
+    formatBranchLine(SAMPLE, {
+      showChecks: true,
+      showPr: true,
+      current: false,
+      draft: true,
+      expand: "closed",
+    }),
+    "feat/api-client [47/48] [draft] ▸",
+  );
+});
+
 Deno.test("summarizeApprovals counts approvals and pending reviewers", () => {
   assertEquals(
     summarizeApprovals(
