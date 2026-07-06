@@ -5,7 +5,6 @@ import { parseArgs as parse } from "jsr:@std/cli@1/parse-args";
 import { die } from "./colors.ts";
 
 export type Mode =
-  | "current"
   | "yours"
   | "all"
   | "org"
@@ -21,32 +20,31 @@ export interface CliOptions {
 
 const HELP = `Usage: git dash [OPTIONS]
 
-Interactive view of the PR stack containing the current branch. The root
-branch renders at the top; each PR below it, indented one space per level.
-Filled radios (●) mark the branches the current selection would rebase;
-empty radios (○) are left untouched.
+Interactive view of your open PRs in this repo, grouped into stacks, with the
+current branch's PR highlighted. The root branch renders at the top; each PR
+below it, indented one space per level. Filled radios (●) mark the branches the
+current selection would rebase; empty radios (○) are left untouched.
 
-The session has two tabs — Pull Requests and Settings — switched with Tab /
-Shift-Tab.
+The tabs across the top are the scopes, named for what they cover — the repo,
+its owner/org, and you — switched with Tab / Shift-Tab; press s to open Settings
+and s or Esc to return.
 
 OPTIONS:
-  --scope=<scope> Which PRs to show (default: current):
-                    current  the current branch's PR and its ancestors
+  --scope=<scope> Which PRs to show (default: yours):
                     yours    all of your open PRs in this repo, grouped into
-                             stacks
+                             stacks, with the current branch highlighted
                     org      all of your open PRs across the current repo's
                              organization, grouped by repo (read-only overview)
                     all      all of your open PRs across every repo, grouped by
                              repo (read-only overview); enter opens a PR on
                              GitHub
   --configure [URL]
-                  Open the session onto the Settings tab: toggle the checks
+                  Open the session onto the Settings screen: toggle the checks
                   column and the PR detail line, set the auto-refresh interval,
-                  and bind keys to GitHub Actions workflows. Tab switches to the
-                  Pull Requests tab from there. With a URL (or local path) to a
-                  shared JSON file, its action bindings are downloaded and
-                  merged into this repo's config first — handy for sharing team
-                  configs
+                  and bind keys to GitHub Actions workflows. Press s or Esc to
+                  return to your PRs. With a URL (or local path) to a shared
+                  JSON file, its action bindings are downloaded and merged into
+                  this repo's config first — handy for sharing team configs
   --dir <path>    Run against the git repository at <path> instead of the
                   current directory
   --no-push       Rebase locally only; skip force-pushing
@@ -57,13 +55,12 @@ COMMANDS:
                   shell to run it:  git dash upgrade | bash
 
 Keys are shown in-app: the footer lists the actions for the current selection,
-and the header shows the Pull Requests / Settings tabs. Settings are saved
-per-repo in
-~/.git-dash.json.`;
+and the header shows the scope tabs. Display settings are global; action-key
+bindings are per-repo. Both live in ~/.git-dash.json.`;
 
 // --scope selects which PRs to show; each value maps 1:1 to an internal Mode.
 // --configure is a separate mode (it opens the Settings tab).
-const SCOPES = ["current", "yours", "org", "all"] as const;
+const SCOPES = ["yours", "org", "all"] as const;
 
 export function parseArgs(args: string[]): CliOptions {
   const flags = parse(args, {
@@ -95,7 +92,7 @@ export function parseArgs(args: string[]): CliOptions {
   // configure takes precedence and (optionally) carries a string value; its
   // presence is what selects the mode.
   const configureGiven = flags.configure !== undefined;
-  let mode: Mode = "current";
+  let mode: Mode = "yours";
   if (configureGiven) {
     mode = "configure";
   } else if (flags.scope !== undefined) {

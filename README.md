@@ -19,17 +19,19 @@ entire chain with one keystroke.
   someone requests changes.
 - **Drill into checks.** Expand any PR to see each check with a ✓/✗/pending
   glyph (failures first) and open it in the browser.
-- **Pick your scope.** The current branch's stack, all your PRs in this repo, or
-  a read-only overview of every PR you have open across a whole org or all of
-  GitHub — via `--scope`.
+- **Pick your scope.** The tabs across the top are named after what they cover:
+  the **repo** (your PRs here, the default, current branch highlighted), the
+  **owner/org** (your PRs across it), and **you** (all your open PRs on GitHub).
+  `Tab` / `Shift-Tab` switch between them, or set `--scope`.
 - **Bind keys to GitHub Actions.** Map a key to a workflow and dispatch it on
   the selected branch — share the bindings with your team as a JSON fragment.
 - **Instant startup.** The window paints immediately from a per-repo cache and
   loads fresh data in the background — switch tabs and scroll while it fetches.
 
 ```
-  ● Pull Requests  │    Settings   · tab/⇧tab switch                      ↻ 27s · q quit
-  octocat/hello-world
+  hello-world  │    acme  │    octocat   · tab/⇧tab switch                      s settings
+
+  acme/hello-world · feat/profile-avatar
 
     ● main · 2 behind origin
      ● feat/api-client [2/2] [5/5] ▸
@@ -41,7 +43,14 @@ entire chain with one keystroke.
 
   → checks · r rebase · c checkout
   d deploy · e e2e tests
+  q quit                                                                            ↻ 27s
 ```
+
+The scope tabs are named for what they show — here the repo `hello-world`, the
+owner `acme`, and the user `octocat`; the active one is purple. `s settings`
+(top-right) opens Settings. The repo slug and current branch sit just below, and
+the bottom row carries `q quit` on the left and the load/refresh state on the
+right.
 
 Filled radios (`●`) mark the branches your current selection would rebase — the
 root plus every branch up to the selected row (whose radio is bold); empty
@@ -90,8 +99,7 @@ git dash upgrade | bash
 ## Usage
 
 ```sh
-git dash                     # current branch's PR and its ancestors (default)
-git dash --scope=yours       # all of your open PRs in this repo, grouped into stacks
+git dash                     # your open PRs in this repo, current branch highlighted (default)
 git dash --scope=org         # your open PRs across the current repo's org, grouped by repo
 git dash --scope=all         # your open PRs across every repo, grouped by repo
 git dash --configure         # settings: columns, auto-refresh, action keys
@@ -100,22 +108,21 @@ git dash --dir ./some-repo   # run against another directory's repository
 git dash upgrade | bash      # update git-dash in place
 ```
 
-`--scope` selects which PRs to show; it defaults to `current`. The default scope
-boots fast: one `gh pr view` for the current branch, then one per ancestor up to
-the root (the first base with no open PR, e.g. `main`) — it never lists the
-whole repo's PRs. `--scope=yours` lists all PRs you authored and groups them
-into stacks. `--scope=org` and `--scope=all` widen that across repos via
+`--scope` selects which PRs to show; it defaults to `yours` — all the PRs you've
+authored in this repo, grouped into stacks, with the current branch's PR
+selected on open. `--scope=org` and `--scope=all` widen that across repos via
 `gh search prs`; since the cross-repo search exposes less detail (no base
 branch, diff size, checks, or approvals), those are read-only overviews grouped
 by repo — `enter` opens the selected PR on GitHub.
 
-PRs load in the background, so the session is usable the instant it opens: you
-can switch tabs, scroll cached rows, and open Settings while the fetch runs.
+The scope tabs boot instantly from a per-scope cache and load fresh data in the
+background; navigating, opening PRs, and switching tabs stay responsive
+throughout, and the load/refresh state shows bottom-right.
 
 ## Keys
 
-- `Tab` / `Shift-Tab` — switch between the **Pull Requests** and **Settings**
-  tabs
+- `Tab` / `Shift-Tab` — switch scope (the top tabs: repo → owner → you)
+- `s` — open Settings; `s` or `Esc` returns to the current scope
 - `↑`/`↓` or `k`/`j` — move the selection
 - `enter` / `space` — open the current selection: the PR on GitHub, or (with a
   check selected) that check in the browser
@@ -129,17 +136,19 @@ can switch tabs, scroll cached rows, and open Settings while the fetch runs.
   branch; press again once the run is up to open it
 - `q` — quit
 
-The footer lists only the actions distinctive to the current selection —
-navigation, tab-switching, `enter` to open, and `q` are implicit.
+A refresh never locks the UI — you can keep navigating and opening PRs while it
+runs; only rebase/checkout/dispatch wait for it to finish. The footer lists only
+the actions distinctive to the current selection — navigation, scope-switching,
+`enter` to open, and `q` are implicit.
 
 ## Configure
 
-Open the Settings tab with `Tab` (or launch onto it with
-`git dash --configure`). A preview PR in a bordered box re-renders as you change
-settings:
+Open Settings with `s` (or launch onto it with `git dash --configure`); `s` or
+`Esc` returns to your PRs. A preview PR in a bordered box re-renders as you
+change settings:
 
-- **Config File** — the path to the per-repo settings file; `enter` opens it in
-  your default editor.
+- **Config File** — the path to the settings file; `enter` opens it in your
+  default editor.
 - **Show Checks** — toggle the `[passed/total]` column.
 - **Show Pull Request** — toggle the `#num title  +adds −dels · ahead` line
   under each branch. When hidden, the delta moves onto the branch line.
@@ -148,9 +157,11 @@ settings:
   interval with a countdown in the header, and `R` refreshes on demand.
 - **Action Keys** — bind any active GitHub Actions workflow to a key (`a-z`,
   `0-9`) to dispatch it on the selected branch. `enter` renames a binding; `esc`
-  unbinds. The letters `j k q r c v` are reserved.
+  unbinds. The letters `j k q r c v s` are reserved.
 
-Settings are saved per-repo in `~/.git-dash.json`.
+Display settings (checks, pull request, approvals, auto-refresh) are global and
+apply to every repo; action-key bindings are saved per-repo. Both live in
+`~/.git-dash.json`.
 
 ### Sharing team configurations
 

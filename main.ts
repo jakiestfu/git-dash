@@ -14,6 +14,7 @@ import {
   dim,
   green,
   grey,
+  magenta,
   red,
   yellow,
 } from "./colors.ts";
@@ -39,13 +40,14 @@ import {
 import { type CliOptions, type Mode, parseArgs } from "./cli.ts";
 
 // ── Config ───────────────────────────────────────────────────────────────────
-// Per-repo settings live in one JSON file in the user's home directory:
-//   { "repos": { "owner/repo": { "showChecks": true,
-//                                "showPr": true,
-//                                "showApprovals": true,
-//                                "autoRefresh": 30,
-//                                "actions": { "t": { "workflow": "x.yml",
+// One JSON file in the user's home directory holds both the global display
+// settings (shared across every repo) and the per-repo action-key bindings:
+//   { "settings": { "showChecks": true, "showPr": true,
+//                   "showApprovals": true, "autoRefresh": 30 },
+//     "repos": { "owner/repo": { "actions": { "t": { "workflow": "x.yml",
 //                                                    "name": "X" } } } } }
+// Older files stored the display settings per-repo; those are still read as a
+// fallback, but any save migrates them to the global block.
 
 interface ActionBinding {
   workflow: string;
@@ -75,7 +77,8 @@ export function formatCountdown(secs: number): string {
   return s ? `${m}m${s}s` : `${m}m`;
 }
 const ACTION_RUN_ID = new Map<string, string>();
-let REPO_SLUG = "";
+let REPO_SLUG = ""; // "owner/repo" of the current repo
+let GH_USER = ""; // the authenticated gh login, for the "all" tab label
 
 // deno-lint-ignore no-explicit-any
 function readJsonFile(path: string): any | null {
@@ -92,16 +95,21 @@ function configLoad(): void {
   SHOW_PR = true;
   SHOW_APPROVALS = true;
   AUTO_REFRESH = 0;
-  if (!REPO_SLUG) return;
-  const repo = readJsonFile(CONFIG_FILE)?.repos?.[REPO_SLUG];
-  if (!repo) return;
-  if (repo.showChecks === false) SHOW_CHECKS = false;
-  if (repo.showPr === false) SHOW_PR = false;
-  if (repo.showApprovals === false) SHOW_APPROVALS = false;
-  if (AUTO_REFRESH_STEPS.includes(repo.autoRefresh)) {
-    AUTO_REFRESH = repo.autoRefresh;
-  }
-  for (const [key, val] of Object.entries(repo.actions ?? {})) {
+
+  const cfg = readJsonFile(CONFIG_FILE);
+  if (!cfg) return;
+
+  // Global display settings, with a fallback to this repo's old per-repo block
+  // (migrated to the global block on the next save).
+  const repo = REPO_SLUG ? cfg.repos?.[REPO_SLUG] : undefined;
+  const s = cfg.settings ?? repo ?? {};
+  if (s.showChecks === false) SHOW_CHECKS = false;
+  if (s.showPr === false) SHOW_PR = false;
+  if (s.showApprovals === false) SHOW_APPROVALS = false;
+  if (AUTO_REFRESH_STEPS.includes(s.autoRefresh)) AUTO_REFRESH = s.autoRefresh;
+
+  // Action bindings stay per-repo.
+  for (const [key, val] of Object.entries(repo?.actions ?? {})) {
     const v = val as Partial<ActionBinding>;
     if (!key || !v?.workflow) continue;
     ACTIONS.set(key, { workflow: v.workflow, name: v.name || v.workflow });
@@ -109,24 +117,30 @@ function configLoad(): void {
 }
 
 function configSave(): void {
-  if (!REPO_SLUG) return;
   const base = readJsonFile(CONFIG_FILE) ?? {};
-  const actions: Record<string, ActionBinding> = {};
-  for (const [k, v] of ACTIONS) actions[k] = v;
-  const next = {
-    ...base,
-    version: 1,
-    repos: {
-      ...(base.repos ?? {}),
-      [REPO_SLUG]: {
-        showChecks: SHOW_CHECKS,
-        showPr: SHOW_PR,
-        showApprovals: SHOW_APPROVALS,
-        autoRefresh: AUTO_REFRESH,
-        actions,
-      },
-    },
+
+  // Global display settings shared across every repo.
+  const settings = {
+    showChecks: SHOW_CHECKS,
+    showPr: SHOW_PR,
+    showApprovals: SHOW_APPROVALS,
+    autoRefresh: AUTO_REFRESH,
   };
+
+  // Per-repo block now holds only the action bindings. Drop the stale display
+  // fields older files kept here so they can't shadow the global settings.
+  const repos: Record<string, unknown> = {};
+  for (const [slug, val] of Object.entries(base.repos ?? {})) {
+    const { actions } = (val ?? {}) as { actions?: unknown };
+    if (actions) repos[slug] = { actions };
+  }
+  if (REPO_SLUG) {
+    const actions: Record<string, ActionBinding> = {};
+    for (const [k, v] of ACTIONS) actions[k] = v;
+    repos[REPO_SLUG] = { actions };
+  }
+
+  const next = { ...base, version: 1, settings, repos };
   const tmp = `${CONFIG_FILE}.tmp-${Deno.pid}`;
   Deno.writeTextFileSync(tmp, JSON.stringify(next, null, 2) + "\n");
   Deno.renameSync(tmp, CONFIG_FILE);
@@ -429,51 +443,8 @@ function addSubtree(branch: string, depth: number): void {
   }
 }
 
-// Default mode: one `gh pr view` for the current branch, then one per ancestor
-// while walking up the bases — instead of listing every open PR in the repo.
-// onStep (if given) is called after each `gh` round-trip so the caller can
-// keep the loading indicator live.
-async function loadStackCurrent(onStep?: () => void): Promise<void> {
-  CUR_BRANCH = (await tryOut("git", ["branch", "--show-current"])) ?? "";
-  if (!CUR_BRANCH) throw new Error("detached HEAD; check out a branch first");
-  onStep?.();
-
-  // Walk the PRs into a scratch map first, so the current view (a cache or the
-  // last data) stays on screen until we have a full replacement.
-  const fields = prFields();
-  const walked = new Map<string, PrInfo>();
-  let b = CUR_BRANCH;
-  const chain: string[] = [];
-  while (chain.length < 50) {
-    const raw = await tryOut("gh", ["pr", "view", b, "--json", fields]);
-    onStep?.();
-    if (raw === null) break;
-    let pr;
-    try {
-      pr = JSON.parse(raw);
-    } catch {
-      break;
-    }
-    if (pr.state !== "OPEN") break;
-    walked.set(pr.headRefName, prInfoOf(pr));
-    chain.unshift(b);
-    b = walked.get(b)!.base;
-  }
-  if (chain.length === 0) {
-    throw new Error(`no open pull request found for branch '${CUR_BRANCH}'`);
-  }
-
-  resetStack();
-  for (const [k, v] of walked) PRS.set(k, v);
-  addRootRow(b);
-  let depth = 1;
-  for (const br of chain) {
-    addRow(br, PRS.get(br)!.base, depth);
-    depth += 1;
-  }
-}
-
-// --yours: every open PR you authored, grouped into stacks. A base that isn't
+// yours (the default): every open PR you authored, grouped into stacks. A base
+// that isn't
 // one of your PRs (main, or someone else's PR branch) becomes a stack root.
 async function loadStackYours(): Promise<void> {
   CUR_BRANCH = (await tryOut("git", ["branch", "--show-current"])) ?? "";
@@ -618,12 +589,38 @@ function isOverview(): boolean {
   return MODE === "all" || MODE === "org";
 }
 
-// loadStack: dispatch to the loader for the current MODE. onStep, if given, is
-// forwarded to loaders that report per-round-trip progress.
-function loadStack(onStep?: () => void): Promise<void> {
-  if (MODE === "yours") return loadStackYours();
+// The scope tabs, in tab-bar order. --configure / upgrade aren't scopes, so
+// they never take part.
+const SCOPE_CYCLE: Mode[] = ["yours", "org", "all"];
+
+// nextScope: the scope `step` tabs away from `cur`, wrapping. +1 is Tab, -1 is
+// Shift-Tab. A non-scope mode falls back to the first scope.
+export function nextScope(cur: Mode, step: number): Mode {
+  const i = SCOPE_CYCLE.indexOf(cur);
+  const from = i < 0 ? 0 : i;
+  return SCOPE_CYCLE[(from + step + SCOPE_CYCLE.length) % SCOPE_CYCLE.length];
+}
+
+// Tab-bar label for a scope, named after the entity it covers: the repo for
+// "yours", the owner/org for "org", and the current user for "all". Falls back
+// to a generic label when the name isn't known (e.g. no remote, or gh login
+// hasn't resolved yet).
+function scopeLabel(mode: Mode): string {
+  const [owner, repo] = REPO_SLUG.split("/");
+  switch (mode) {
+    case "org":
+      return owner || "Org";
+    case "all":
+      return GH_USER || "All";
+    default:
+      return repo || "Repo";
+  }
+}
+
+// loadStack: dispatch to the loader for the current MODE.
+function loadStack(): Promise<void> {
   if (isOverview()) return loadStackAll();
-  return loadStackCurrent(onStep);
+  return loadStackYours();
 }
 
 async function refExists(ref: string): Promise<boolean> {
@@ -856,7 +853,7 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
 
 let PUSH = true;
 let BASE_DIR = "";
-let MODE: Mode = "current";
+let MODE: Mode = "yours";
 let CONFIG_IMPORT = "";
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
@@ -892,45 +889,42 @@ let HEADER: string[] = [];
 // LINES scrolls in the space above them.
 let FOOTER: string[] = [];
 
-// The interactive session is a two-tab UI (Tab / Shift-Tab switches). The
-// stack tab is the PR view; the settings tab is what --configure opens onto.
-// Each tab owns its own selection cursor and build/keys functions, but both
-// paint through the shared LINES/FOOTER machinery above.
-export type Tab = "stack" | "settings";
-let TAB: Tab = "stack";
-export const TABS: Tab[] = ["stack", "settings"];
-const TAB_LABEL: Record<Tab, string> = {
-  stack: "Pull Requests",
-  settings: "Settings",
-};
+// The interactive session shows either a scope (the PR view) or the Settings
+// screen. The top tab bar is the three scopes, cycled with Tab / Shift-Tab;
+// pressing `s` toggles the Settings screen over the top of the current scope.
+let SETTINGS_OPEN = false;
 
-// nextTab: the tab `step` positions away from `cur`, wrapping around. +1 is
-// Tab, -1 is Shift-Tab.
-export function nextTab(cur: Tab, step: number): Tab {
-  const i = TABS.indexOf(cur);
-  return TABS[(i + step + TABS.length) % TABS.length];
-}
-
-// tabBar: the left side of the header line, with the active tab highlighted.
+// tabBar: the scope tabs across the top. The active scope is bold magenta (the
+// same accent as the settings hint); the rest are dimmed. While Settings is
+// open no tab is active, so they're all dimmed.
 function tabBar(): string {
-  const cells = TABS.map((t) =>
-    t === TAB ? bold(cyan(`● ${TAB_LABEL[t]}`)) : dim(`  ${TAB_LABEL[t]}`)
+  const cells = SCOPE_CYCLE.map((m) =>
+    !SETTINGS_OPEN && m === MODE
+      ? bold(magenta(scopeLabel(m)))
+      : dim(scopeLabel(m))
   );
   return `  ${cells.join(dim("  │  "))}${dim("   · tab/⇧tab switch")}`;
 }
 
-// headerStatus: the discreet indicator shown at the far right of the header.
-// Always ends with "q quit"; on the stack tab the load/refresh state or
-// auto-refresh countdown is prepended, separated by a middot.
+// headerStatus: the hint at the far right of the header row. It advertises the
+// Settings screen (and how to leave it), in magenta so this navigation affordance
+// stands out. The quit hint lives at the bottom, next to the refresh state.
 function headerStatus(): string {
-  let lead = "";
-  if (TAB === "stack") {
-    if (LOADING) lead = `${SPIN_FRAMES[SPIN_I % 10]} loading`;
-    else if (REFRESHING) lead = `${SPIN_FRAMES[SPIN_I % 10]} refreshing`;
-    else if (STALE) lead = "cached";
-    else if (AUTO_REFRESH > 0) lead = `↻ ${formatCountdown(REFRESH_LEFT)}`;
-  }
-  return dim(lead ? `${lead} · q quit` : "q quit");
+  return SETTINGS_OPEN
+    ? bold(magenta("s / esc back"))
+    : bold(magenta("s settings"));
+}
+
+// refreshStatus: the load/refresh state shown at the bottom-right — the loading
+// or refreshing spinner, a "cached" marker, or the auto-refresh countdown.
+// Empty when there's nothing to report (or on the Settings screen).
+function refreshStatus(): string {
+  if (SETTINGS_OPEN) return "";
+  if (LOADING) return `${SPIN_FRAMES[SPIN_I % 10]} loading`;
+  if (REFRESHING) return `${SPIN_FRAMES[SPIN_I % 10]} refreshing`;
+  if (STALE) return "cached";
+  if (AUTO_REFRESH > 0) return `↻ ${formatCountdown(REFRESH_LEFT)}`;
+  return "";
 }
 
 const INTERACTIVE = Deno.stdin.isTerminal() && Deno.stdout.isTerminal();
@@ -1058,7 +1052,7 @@ async function readLine(prompt: string): Promise<string> {
 
 // ── Configure view ───────────────────────────────────────────────────────────
 // Letters the main view already uses; they can't be bound to workflows.
-const RESERVED_KEYS = "jkqrcv";
+const RESERVED_KEYS = "jkqrcvs";
 
 // importActions: fetch a shared JSON file (URL or local path) and merge its
 // action bindings into this repo's config. The file may be a full config
@@ -1301,6 +1295,7 @@ function buildSettingsLines(): void {
     FOOTER.push("");
     FOOTER.push(`  ${yellow(CMSG)}`);
   }
+  if (INTERACTIVE) FOOTER.push(bottomStatusRow());
 }
 
 // Rename how a bound action is shown (in the footer and the list); the name is
@@ -1457,8 +1452,9 @@ function buildHeader(): void {
     bar = `${left}${" ".repeat(Math.max(gap, 1))}${status}`;
   }
   // The bold slug reads as the title of what's below; a blank line sets it off
-  // from the tab bar.
-  const repo = bold(cyan(REPO_SLUG || "local"));
+  // from the tab bar. The current branch trails it after a grey middot.
+  let repo = bold(cyan(REPO_SLUG || "local"));
+  if (CUR_BRANCH) repo += grey(` · ${CUR_BRANCH}`);
   HEADER = [
     "",
     bar,
@@ -1598,8 +1594,8 @@ function buildLines(): void {
         parts.push("c checkout");
       }
     }
-    // The auto-refresh countdown/spinner lives in the header now; the footer
-    // keeps just the manual-refresh key hint.
+    // The manual-refresh key hint (the countdown/state itself shows on the
+    // bottom status row).
     if (ROWS.length > 0 && AUTO_REFRESH > 0) parts.push("R refresh");
 
     FOOTER.push("");
@@ -1625,10 +1621,23 @@ function buildLines(): void {
       FOOTER.push(`    ${grey(line)}`);
     }
   }
+  // The very bottom row: quit hint on the left, load/refresh state on the right.
+  if (INTERACTIVE) FOOTER.push(bottomStatusRow());
+}
+
+// bottomStatusRow: the pinned last line — "q quit" at the left, the load/
+// refresh state at the right.
+function bottomStatusRow(): string {
+  const left = `  ${dim("q quit")}`;
+  const status = refreshStatus();
+  if (!status) return left;
+  const s = dim(status);
+  const gap = termCols() - 2 - visibleWidth(left) - visibleWidth(s);
+  return gap > 1 ? `${left}${" ".repeat(gap)}${s}  ` : left;
 }
 
 function render(): void {
-  if (TAB === "settings") {
+  if (SETTINGS_OPEN) {
     buildSettingsLines();
   } else {
     buildLines();
@@ -1734,8 +1743,10 @@ async function openSelectedCheck(): Promise<void> {
 // refreshData: re-fetch PRs and git stats in place. On failure the previous
 // data is restored, so a flaky network never blanks the view.
 async function refreshData(): Promise<void> {
-  if (BUSY) return;
-  BUSY = true;
+  // Refresh doesn't hold BUSY: navigation, opening PRs, tab-switch, and Settings
+  // all stay live while it runs. Only mutating actions (rebase/checkout/dispatch/
+  // scope-switch) defer on REFRESHING — see mutationsBlocked().
+  if (BUSY || REFRESHING) return;
   REFRESHING = true;
   render();
 
@@ -1763,6 +1774,64 @@ async function refreshData(): Promise<void> {
     ? Math.min(CHECK_SEL, rowChecks(SEL).length - 1)
     : -1;
   REFRESHING = false;
+  render();
+}
+
+// mutationsBlocked: true while an operation that must not overlap another is in
+// flight — a rebase/dispatch (BUSY), the initial load (LOADING), or an in-place
+// refresh (REFRESHING). Read-only keys ignore this; mutating keys defer on it.
+function mutationsBlocked(): boolean {
+  return BUSY || LOADING || REFRESHING;
+}
+
+// switchScope: change which set of PRs is shown while the session is live. The
+// new scope's cache (if any) paints instantly; then a background fetch replaces
+// it. On total failure the previous scope is restored so the view never blanks.
+async function switchScope(to: Mode): Promise<void> {
+  if (mutationsBlocked() || to === MODE) return;
+  const prevMode = MODE;
+  const prevRows = ROWS.map((r) => ({ ...r }));
+  const prevCur = CUR_BRANCH;
+
+  MODE = to;
+  CHECK_SEL = -1;
+  EXPANDED.clear();
+  INFO = "";
+
+  // Paint this scope's cached rows immediately (marked stale); otherwise clear
+  // the view so it's obvious a fresh load is underway.
+  const cached = loadStackCache();
+  if (cached) {
+    restoreRows(cached.rows);
+    CUR_BRANCH = cached.curBranch;
+    STALE = true;
+  } else {
+    resetStack();
+    STALE = false;
+  }
+  SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
+  render();
+
+  BUSY = true;
+  LOADING = true;
+  render();
+  try {
+    await loadStack();
+    if (!isOverview()) await loadGitStats();
+    STALE = false;
+    INFO = "";
+    saveStackCache();
+    SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
+  } catch (e) {
+    // Roll back to the scope we came from so the view stays populated.
+    MODE = prevMode;
+    CUR_BRANCH = prevCur;
+    restoreRows(prevRows);
+    SEL = ROW_OF.get(CUR_BRANCH) ?? 1;
+    STALE = false;
+    INFO = `${scopeLabel(to)}: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  LOADING = false;
   BUSY = false;
   render();
 }
@@ -1841,12 +1910,12 @@ async function runActionKey(key: string): Promise<void> {
   render();
 }
 
-// switchTab: move to another tab, lazily loading the settings tab's workflow
-// list the first time it's opened (with a spinner, since it shells out to gh).
-async function switchTab(to: Tab): Promise<void> {
-  if (TAB === to) return;
-  TAB = to;
-  if (to === "settings" && !SETTINGS_LOADED) {
+// openSettings: show the Settings screen over the current scope, lazily loading
+// the workflow list the first time (with a spinner, since it shells out to gh).
+async function openSettings(): Promise<void> {
+  if (SETTINGS_OPEN) return;
+  SETTINGS_OPEN = true;
+  if (!SETTINGS_LOADED) {
     CMSG = "";
     buildHeader();
     LINES = ["", dim("  loading workflows…")];
@@ -1858,32 +1927,55 @@ async function switchTab(to: Tab): Promise<void> {
   render();
 }
 
+function closeSettings(): void {
+  if (!SETTINGS_OPEN) return;
+  SETTINGS_OPEN = false;
+  CMSG = "";
+  render();
+}
+
 async function inputLoop(): Promise<void> {
   loop: while (true) {
     const keys = await readKeys();
     if (keys === null) break;
     for (const key of keys) {
       if (key === "q" || key === "\x03") break loop;
-      // A timer-driven refresh may be running while we sit in readKeys; drop
-      // action keys instead of interleaving with it.
-      if (BUSY) continue;
-      // Tab / Shift-Tab cycle tabs from either view.
+
+      // ── Settings screen ─────────────────────────────────────────────────
+      if (SETTINGS_OPEN) {
+        // `s` always returns to the scope view; esc does too, unless the
+        // selected row has a binding to unbind (handleSettingsKey owns that).
+        if (key === "s") {
+          closeSettings();
+        } else if (key === "\x1b" && !keyOfWf(WORKFLOWS[CSEL - 5]?.id ?? "")) {
+          closeSettings();
+        } else {
+          await handleSettingsKey(key);
+        }
+        continue;
+      }
+
+      // ── Scope view ──────────────────────────────────────────────────────
+      // `s` opens Settings; Tab / Shift-Tab cycle the scope (a blocking load).
+      if (key === "s") {
+        await openSettings();
+        continue;
+      }
       if (key === "\t") {
-        await switchTab(nextTab(TAB, 1));
+        await switchScope(nextScope(MODE, 1));
         continue;
       }
       if (key === "\x1b[Z") {
-        await switchTab(nextTab(TAB, -1));
+        await switchScope(nextScope(MODE, -1));
         continue;
       }
-      if (TAB === "settings") {
-        await handleSettingsKey(key);
-        continue;
-      }
-      // The stack can be empty if it failed to load (e.g. --configure on a
-      // detached HEAD); only tab-switch and quit apply until there are rows.
+
+      // The stack can be empty if it failed to load; only the above apply until
+      // there are rows.
       if (ROWS.length === 0) continue;
       const last = ROWS.length - 1;
+
+      // Read-only keys work at all times — including during a refresh.
       if (key === "\x1b[A" || key === "k") {
         if (CHECK_SEL >= 0) {
           CHECK_SEL -= 1;
@@ -1923,15 +2015,19 @@ async function inputLoop(): Promise<void> {
           CHECK_SEL = -1;
           render();
         }
+      } else if (key === "v") {
+        await openSelectedPr();
+      } else if (key === "R" && AUTO_REFRESH > 0 && !mutationsBlocked()) {
+        REFRESH_LEFT = AUTO_REFRESH;
+        await refreshData();
+      } else if (mutationsBlocked()) {
+        // A rebase/dispatch or an in-place refresh is running — defer the
+        // mutating keys below until it finishes.
+        continue;
       } else if (key === "r") {
         if (!isOverview()) await startRebase();
       } else if (key === "c") {
         if (!isOverview()) await checkoutSelected();
-      } else if (key === "v") {
-        await openSelectedPr();
-      } else if (key === "R" && AUTO_REFRESH > 0) {
-        REFRESH_LEFT = AUTO_REFRESH;
-        await refreshData();
       } else if (key.length === 1 && ACTIONS.has(key)) {
         await runActionKey(key);
       }
@@ -1976,7 +2072,7 @@ async function initialLoad(): Promise<void> {
   const hadCache = ROWS.length > 0;
   let loadErr = "";
   try {
-    await loadStack(() => render());
+    await loadStack();
     STALE = false;
     INFO = "";
   } catch (e) {
@@ -2048,6 +2144,8 @@ async function main(): Promise<void> {
   await requireDeps();
 
   REPO_SLUG = await repoSlug();
+  GH_USER = (await tryOut("gh", ["api", "user", "--jq", ".login"]))?.trim() ??
+    "";
   configLoad();
 
   // --configure opens the session onto the Settings tab; Tab switches back to
@@ -2097,7 +2195,7 @@ async function main(): Promise<void> {
     STALE = true;
   }
   if (startOnSettings) {
-    TAB = "settings";
+    SETTINGS_OPEN = true;
     await loadSettings();
   }
   render();
@@ -2112,7 +2210,8 @@ async function main(): Promise<void> {
   if (AUTO_REFRESH > 0) {
     REFRESH_LEFT = AUTO_REFRESH;
     REFRESH_TIMER = setInterval(() => {
-      if (BUSY) return; // pause the countdown while an operation runs
+      // Pause the countdown while a rebase/dispatch or a refresh is running.
+      if (mutationsBlocked()) return;
       REFRESH_LEFT -= 1;
       if (REFRESH_LEFT <= 0) {
         REFRESH_LEFT = AUTO_REFRESH;

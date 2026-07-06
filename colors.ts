@@ -8,6 +8,7 @@ import {
   dim,
   gray,
   green,
+  magenta,
   red,
   setColorEnabled,
   yellow,
@@ -16,7 +17,7 @@ import {
 // grey: British spelling used throughout the app.
 const grey = gray;
 
-export { bold, cyan, dim, green, grey, red, yellow };
+export { bold, cyan, dim, green, grey, magenta, red, yellow };
 
 // Disable color when stdout isn't a terminal or NO_COLOR is set.
 export function applyColorPreference(): void {

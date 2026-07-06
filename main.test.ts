@@ -9,7 +9,7 @@ import {
   extractCheckItems,
   formatCountdown,
   nextAutoRefresh,
-  nextTab,
+  nextScope,
   summarizeChecks,
 } from "./main.ts";
 
@@ -120,16 +120,21 @@ Deno.test("formatCountdown renders seconds and minutes", () => {
   assertEquals(formatCountdown(300), "5m");
 });
 
-// ── nextTab ──────────────────────────────────────────────────────────────────
+// ── nextScope ────────────────────────────────────────────────────────────────
 
-Deno.test("nextTab cycles forward and wraps", () => {
-  assertEquals(nextTab("stack", 1), "settings");
-  assertEquals(nextTab("settings", 1), "stack");
+Deno.test("nextScope cycles forward and wraps", () => {
+  assertEquals(nextScope("yours", 1), "org");
+  assertEquals(nextScope("org", 1), "all");
+  assertEquals(nextScope("all", 1), "yours");
 });
 
-Deno.test("nextTab cycles backward and wraps", () => {
-  assertEquals(nextTab("settings", -1), "stack");
-  assertEquals(nextTab("stack", -1), "settings");
+Deno.test("nextScope cycles backward and wraps", () => {
+  assertEquals(nextScope("yours", -1), "all");
+  assertEquals(nextScope("all", -1), "org");
+});
+
+Deno.test("nextScope falls back to the first scope from a non-scope mode", () => {
+  assertEquals(nextScope("configure", 1), "org");
 });
 
 // ── decodeKeys ───────────────────────────────────────────────────────────────
