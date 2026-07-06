@@ -14,8 +14,8 @@ Deno.test("normalizeRepoUrl strips ssh form", () => {
 
 Deno.test("normalizeRepoUrl strips https form", () => {
   assertEquals(
-    normalizeRepoUrl("https://github.com/jakiestfu/git-convoy.git"),
-    "jakiestfu/git-convoy",
+    normalizeRepoUrl("https://github.com/jakiestfu/git-dash.git"),
+    "jakiestfu/git-dash",
   );
 });
 

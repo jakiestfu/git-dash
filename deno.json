@@ -4,7 +4,7 @@
     "test": "deno test --allow-run --allow-read --allow-write --allow-env",
     "fmt": "deno fmt",
     "run": "deno run --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net main.ts",
-    "compile": "deno compile --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net --output dist/git-convoy main.ts"
+    "compile": "deno compile --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net --output dist/git-dash main.ts"
   },
   "fmt": {
     "exclude": ["dist/"]

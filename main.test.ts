@@ -175,7 +175,7 @@ async function runCli(
 Deno.test("cli --help prints usage and exits 0", async () => {
   const r = await runCli(["--help"]);
   assertEquals(r.code, 0);
-  assert(r.stdout.includes("Usage: git convoy"));
+  assert(r.stdout.includes("Usage: git dash"));
   assert(r.stdout.includes("--configure"));
 });
 

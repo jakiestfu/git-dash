@@ -72,7 +72,7 @@ export async function x(cmd: string, args: string[]): Promise<void> {
 export async function requireDeps(): Promise<void> {
   for (const cmd of ["git", "gh"]) {
     if ((await tryOut(cmd, ["--version"])) === null) {
-      die(`git convoy requires '${cmd}'`);
+      die(`git dash requires '${cmd}'`);
     }
   }
   if ((await tryOut("git", ["rev-parse", "--git-dir"])) === null) {

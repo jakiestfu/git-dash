@@ -1,8 +1,8 @@
-# git convoy
+# git dash
 
-**Manage stacked GitHub pull requests from your terminal.** A convoy is a line
-of PRs following the lead — whether that's one branch against `main` or a
-three-deep stack. `git convoy` shows the whole stack at a glance and rebases the
+**Manage stacked GitHub pull requests from your terminal.** A stack is a line of
+PRs following the lead — whether that's one branch against `main` or a
+three-deep chain. `git dash` shows the whole stack at a glance and rebases the
 entire chain with one keystroke.
 
 ## Features
@@ -25,7 +25,7 @@ entire chain with one keystroke.
   fresh data loads in the background.
 
 ```
-  ● Stack  │    Settings   · tab/⇧tab switch                              ↻ 27s · q quit
+  ● Pull Requests  │    Settings   · tab/⇧tab switch                      ↻ 27s · q quit
   octocat/hello-world
 
     ● main · 2 behind origin
@@ -50,16 +50,16 @@ and `e`) get their own footer line.
 
 ```sh
 # Quick install (one-liner)
-curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-convoy/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-dash/main/install.sh | bash
 
 # Or inspect first
-curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-convoy/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/jakiestfu/git-dash/main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
 
-This installs two commands to `~/.local/bin`: `git-convoy` and its alias
-`git-cv`. If that directory isn't on your `PATH`, add it:
+This installs `git-dash` to `~/.local/bin`. If that directory isn't on your
+`PATH`, add it:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -67,12 +67,12 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Install elsewhere with `PREFIX=/usr/local/bin bash install.sh`. Prefer a
 standalone binary with no Deno dependency? Grab a prebuilt one for your platform
-from the [Releases page](https://github.com/jakiestfu/git-convoy/releases).
+from the [Releases page](https://github.com/jakiestfu/git-dash/releases).
 
 Already installed? Update in place any time:
 
 ```sh
-git cv upgrade | bash
+git dash upgrade | bash
 ```
 
 ### Requirements
@@ -84,17 +84,15 @@ git cv upgrade | bash
 ## Usage
 
 ```sh
-git cv                       # current branch's PR and its ancestors (--current)
-git cv --yours               # all of your open PRs in this repo, grouped into stacks
-git cv --all                 # all of your open PRs across every repo, grouped by repo
-git cv --org                 # like --all, limited to the current repo's organization
-git cv --configure           # settings: checks column, auto-refresh, action keys
-git cv --no-push             # rebase locally only; skip force-pushing
-git cv --dir ./some-repo     # run against another directory's repository
-git cv upgrade | bash        # update git-convoy in place
+git dash                     # current branch's PR and its ancestors (--current)
+git dash --yours             # all of your open PRs in this repo, grouped into stacks
+git dash --all               # all of your open PRs across every repo, grouped by repo
+git dash --org               # like --all, limited to the current repo's organization
+git dash --configure         # settings: checks column, auto-refresh, action keys
+git dash --no-push           # rebase locally only; skip force-pushing
+git dash --dir ./some-repo   # run against another directory's repository
+git dash upgrade | bash      # update git-dash in place
 ```
-
-`git cv` is an alias for `git convoy`; both names work everywhere.
 
 The default view (`--current`) boots fast: one `gh pr view` for the current
 branch, then one per ancestor up to the root (the first base with no open PR,
@@ -106,7 +104,8 @@ repo — `enter` opens the selected PR on GitHub.
 
 ## Keys
 
-- `Tab` / `Shift-Tab` — switch between the **Stack** and **Settings** tabs
+- `Tab` / `Shift-Tab` — switch between the **Pull Requests** and **Settings**
+  tabs
 - `↑`/`↓` or `k`/`j` — move the selection
 - `enter` / `space` — open the current selection: the PR on GitHub, or (with a
   check selected) that check in the browser
@@ -125,8 +124,9 @@ navigation, tab-switching, `enter` to open, and `q` are implicit.
 
 ## Configure
 
-Open the Settings tab with `Tab` (or launch onto it with `git cv --configure`).
-A preview PR in a bordered box re-renders as you change settings:
+Open the Settings tab with `Tab` (or launch onto it with
+`git dash --configure`). A preview PR in a bordered box re-renders as you change
+settings:
 
 - **Show checks** — toggle the `[passed/total]` column.
 - **Show pull request** — toggle the `#num title  +adds −dels · ahead` line
@@ -137,11 +137,11 @@ A preview PR in a bordered box re-renders as you change settings:
   `0-9`) to dispatch it on the selected branch. `enter` renames a binding; `esc`
   unbinds. The letters `j k q r c v` are reserved.
 
-Settings are saved per-repo in `~/.git-convoy.json`.
+Settings are saved per-repo in `~/.git-dash.json`.
 
 ### Sharing team configurations
 
-`git cv --configure <url>` downloads a JSON file (a URL or local path) and
+`git dash --configure <url>` downloads a JSON file (a URL or local path) and
 merges its action bindings into this repo's config. Check a fragment into your
 repo or a gist and teammates pick it up with one command:
 
@@ -157,7 +157,7 @@ repo or a gist and teammates pick it up with one command:
 ## Rebasing safety
 
 Select a PR and press `r`. Every row animates `○ pending → ⠹ running → ✓ done`
-in place. Convoy:
+in place. git dash:
 
 - Refuses to start on a dirty tree, detached HEAD, an in-progress rebase, or
   when any branch in the chain has remote commits you don't have locally.
@@ -170,12 +170,12 @@ in place. Convoy:
 ## Developing
 
 ```sh
-git clone https://github.com/jakiestfu/git-convoy.git
-cd git-convoy
+git clone https://github.com/jakiestfu/git-dash.git
+cd git-dash
 deno task run        # run from source
 deno task check      # type-check
 deno task test       # run the test suite
-deno task compile    # build a standalone binary into dist/git-convoy
+deno task compile    # build a standalone binary into dist/git-dash
 ```
 
 The tool is a small set of TypeScript modules run directly by Deno via `main.ts`

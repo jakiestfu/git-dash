@@ -1,6 +1,6 @@
 #!/usr/bin/env -S deno run --quiet --ext=ts --allow-run=git,gh,open,xdg-open,explorer --allow-read --allow-write --allow-env --allow-net
-// git convoy — interactive TUI for managing stacked GitHub pull requests.
-// Installed as both `git-convoy` and `git-cv`. Runs on Deno 2.x.
+// git dash — interactive TUI for managing stacked GitHub pull requests.
+// Installed as `git-dash`. Runs on Deno 2.x.
 
 const PR_LIMIT = 100;
 
@@ -49,8 +49,8 @@ interface ActionBinding {
   name: string;
 }
 
-const CONFIG_FILE = Deno.env.get("GIT_CONVOY_CONFIG") ??
-  `${Deno.env.get("HOME")}/.git-convoy.json`;
+const CONFIG_FILE = Deno.env.get("GIT_DASH_CONFIG") ??
+  `${Deno.env.get("HOME")}/.git-dash.json`;
 let SHOW_CHECKS = true;
 let SHOW_PR = true; // PR number/title line under each branch
 let AUTO_REFRESH = 0; // seconds between auto-refreshes; 0 = off
@@ -131,8 +131,8 @@ function configSave(): void {
 // place. The cache holds the rendered rows plus the current branch; PR fields
 // live on the rows themselves, so no separate PR map is stored.
 
-const CACHE_FILE = Deno.env.get("GIT_CONVOY_CACHE") ??
-  `${Deno.env.get("HOME")}/.git-convoy-cache.json`;
+const CACHE_FILE = Deno.env.get("GIT_DASH_CACHE") ??
+  `${Deno.env.get("HOME")}/.git-dash-cache.json`;
 
 interface CachedStack {
   curBranch: string;
@@ -743,7 +743,7 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
   }
   render();
 
-  if (!(await convoyStep(chainRootRow, "updated", updateRoot))) {
+  if (!(await cascadeStep(chainRootRow, "updated", updateRoot))) {
     CASCADE_ERR =
       `could not update ${chainRoot} — local ${chainRoot} has diverged from origin/${chainRoot}`;
     return false;
@@ -783,7 +783,7 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
   // once a parent is rebased, merge-base against it would land below the old
   // tip and replay the parent's own commits as duplicates. --fork-point
   // consults the parent's reflog, which also survives the parent having been
-  // rebased outside convoy; plain merge-base is the fallback.
+  // rebased outside git dash; plain merge-base is the fallback.
   const oldParentSha = new Map<number, string>();
   for (const r of CHAIN) {
     const { branch: b, parent: p } = ROWS[r];
@@ -802,7 +802,7 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
       const bSha = await tryOut("git", ["rev-parse", b]);
       const originSha = await tryOut("git", ["rev-parse", `origin/${b}`]);
       if (push && bSha !== originSha) {
-        const ok = await convoyStep(
+        const ok = await cascadeStep(
           r,
           "pushed",
           () => x("git", ["push", "--force-with-lease", "origin", b]),
@@ -813,13 +813,13 @@ async function cascade(target: number, push: boolean): Promise<boolean> {
           return false;
         }
       } else {
-        await convoyStep(r, "up to date", () => Promise.resolve());
+        await cascadeStep(r, "up to date", () => Promise.resolve());
       }
       continue;
     }
 
     const note = push ? "rebased · pushed" : "rebased";
-    if (!(await convoyStep(r, note, () => rebaseBranch(b, p, old, push)))) {
+    if (!(await cascadeStep(r, note, () => rebaseBranch(b, p, old, push)))) {
       await abortRebaseIfAny();
       CASCADE_ERR = `rebase of '${b}' failed — rebase aborted, repo left clean.
   Resolve manually: git rebase --onto ${p} ${old} ${b}`;
@@ -880,7 +880,10 @@ let FOOTER: string[] = [];
 export type Tab = "stack" | "settings";
 let TAB: Tab = "stack";
 export const TABS: Tab[] = ["stack", "settings"];
-const TAB_LABEL: Record<Tab, string> = { stack: "Stack", settings: "Settings" };
+const TAB_LABEL: Record<Tab, string> = {
+  stack: "Pull Requests",
+  settings: "Settings",
+};
 
 // nextTab: the tab `step` positions away from `cur`, wrapping around. +1 is
 // Tab, -1 is Shift-Tab.
@@ -1380,7 +1383,7 @@ function actionHints(): string {
 
 // buildHeader: the pinned top rows shared by both tabs — a blank spacer, the
 // tab bar, the repo slug, and a blank separator. Non-interactive output has no
-// tabs, so it keeps the old single-line "convoy · slug" title in LINES instead.
+// tabs, so it keeps the old single-line "dash · slug" title in LINES instead.
 function buildHeader(): void {
   if (!INTERACTIVE) {
     HEADER = [];
@@ -1407,7 +1410,7 @@ function buildLines(): void {
   LINES = [];
   if (!INTERACTIVE) {
     LINES.push("");
-    LINES.push(`  ${bold("convoy")}${dim(` · ${REPO_SLUG || "local"}`)}`);
+    LINES.push(`  ${bold("dash")}${dim(` · ${REPO_SLUG || "local"}`)}`);
     LINES.push("");
   }
 
@@ -1567,9 +1570,9 @@ function render(): void {
   paint();
 }
 
-// convoyStep: run one cascade step, animating the row's spinner until it
+// cascadeStep: run one cascade step, animating the row's spinner until it
 // settles. See the cascade section for the contract.
-async function convoyStep(
+async function cascadeStep(
   i: number,
   note: string,
   fn: () => Promise<void>,
@@ -1873,20 +1876,20 @@ async function inputLoop(): Promise<void> {
 // ── Upgrade ──────────────────────────────────────────────────────────────────
 
 // runUpgrade: emit the install one-liner so it can be piped to a shell
-// (`git cv upgrade | bash`). Printing rather than spawning a shell keeps the
+// (`git dash upgrade | bash`). Printing rather than spawning a shell keeps the
 // tool from needing run permission for bash. When stdout is a terminal we add
 // a short instruction; when piped, only the bare command is written.
 function runUpgrade(): never {
-  const repo = Deno.env.get("GIT_CONVOY_REPO") ?? "jakiestfu/git-convoy";
-  const ref = Deno.env.get("GIT_CONVOY_REF") ?? "main";
+  const repo = Deno.env.get("GIT_DASH_REPO") ?? "jakiestfu/git-dash";
+  const ref = Deno.env.get("GIT_DASH_REF") ?? "main";
   const oneLiner =
     `curl -fsSL https://raw.githubusercontent.com/${repo}/${ref}/install.sh | bash`;
   if (Deno.stdout.isTerminal()) {
-    console.log(dim("Update git-convoy by running:\n"));
+    console.log(dim("Update git-dash by running:\n"));
     console.log(`  ${oneLiner}\n`);
-    console.log(dim("Or in one step:  git cv upgrade | bash"));
+    console.log(dim("Or in one step:  git dash upgrade | bash"));
   } else {
-    // Piped (`git cv upgrade | bash`): emit only the command to execute.
+    // Piped (`git dash upgrade | bash`): emit only the command to execute.
     console.log(oneLiner);
   }
   Deno.exit(0);
